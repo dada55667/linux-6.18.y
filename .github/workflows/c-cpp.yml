@@ -30,3 +30,11 @@ jobs:
           
           # 这一步开始正式编译
           make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- -j$(nproc)
+      - name: Upload kernel artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: kernel-6.18-arm64
+          path: |
+            linux/arch/arm64/boot/Image
+            linux/arch/arm64/boot/dts/rockchip/rk3568-*.dtb
+          retention-days: 7
