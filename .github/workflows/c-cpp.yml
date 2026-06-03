@@ -13,10 +13,12 @@ jobs:
 
     steps:
     - uses: actions/checkout@v4
+    - name: distclean
+      run: make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- distclean
     - name: make defconfig
-      run: make defconfig
+      run: make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- defconfig
     - name: make
-      run: make
+      run: make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- -j$(nproc)
     - name: make check
       run: make check
     - name: make distcheck
