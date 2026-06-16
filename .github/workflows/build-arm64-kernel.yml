@@ -1,0 +1,67 @@
+name: Build ARM64 Kernel & Release
+
+on:
+  workflow_dispatch:      # 允许手动触发
+    inputs:
+      tag_name:
+        description: "Release Tag (e.e. 6.18.0-20260616)"
+        required: true
+        default: "6.18.0-test"
+  push:
+    tags:
+      - "6.18.*"          # 推 v6.18.x tag 时自动触发
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    env:
+      ARCH: arm64
+      CROSS_COMPILE: aarch64-linux-gnu-
+      KERNEL_VERSION: ${{ github.event.inputs.tag_name || github.ref_name }}
+
+    steps:
+      - name: Checkout kernel source
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential bison flex \
+            libssl-dev libelf-dev \
+            gcc-aarch64-linux-gnu
+
+      - name: Generate .config (替换为你实际的 defconfig 名)
+        run: |
+          make O=out ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- defconfig
+          # 如需额外开启选项可追加:
+          # make O=out ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- olddefconfig
+
+      - name: Compile kernel & modules
+        run: |
+          make O=out ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- -j$(nproc)
+          make O=out ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- modules_install INSTALL_MOD_PATH=./kernel-modules
+
+      - name: Package artifacts
+        run: |
+          mkdir -p release
+          cp out/arch/arm64/boot/Image release/
+          # 可选打包压缩模块
+          tar -czf release/kernel-modules.tar.gz -C kernel-modules lib
+          # 生成说明
+          echo "Kernel: $KERNEL_VERSION built $(date)" > release/README.txt
+
+      - name: Create GitHub Release & Upload
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ env.KERNEL_VERSION }}
+          name: "Linux Kernel ${{ env.KERNEL_VERSION }} (arm64)"
+          files: |
+            release/Image
+            release/kernel-modules.tar.gz
+            release/README.txt
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
