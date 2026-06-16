@@ -23,6 +23,7 @@
 #include <linux/module.h>
 #include <linux/netdevice.h>
 #include <linux/mutex.h>
+#include <linux/of.h>
 #include <linux/phy.h>
 #include <linux/rtnetlink.h>
 #include <linux/timer.h>
@@ -684,6 +685,65 @@ static void netdev_trig_work(struct work_struct *work)
 			(atomic_read(&trigger_data->interval)*2));
 }
 
+static struct device_node *netdev_trig_get_led_node(struct led_classdev *led_cdev)
+{
+	struct device_node *np, *child;
+
+	/* Try direct of_node (set when init_data.fwnode was provided) */
+	np = led_cdev->dev->of_node;
+	if (np)
+		return of_get_child_by_name(np, "netdev");
+
+	/* Fallback: search parent's child nodes by label name
+	 * (gpio-leds with "label" property does not set of_node)
+	 */
+	if (!led_cdev->dev->parent)
+		return NULL;
+	np = led_cdev->dev->parent->of_node;
+	if (!np)
+		return NULL;
+
+	for_each_child_of_node(np, child) {
+		const char *label;
+
+		if (of_property_read_string(child, "label", &label))
+			continue;
+		if (strcmp(label, led_cdev->name))
+			continue;
+
+		return of_get_child_by_name(child, "netdev");
+	}
+
+	return NULL;
+}
+
+static void netdev_trig_of_init(struct led_classdev *led_cdev,
+				struct led_netdev_data *trigger_data)
+{
+	struct device_node *np;
+	const char *device_name;
+
+	np = netdev_trig_get_led_node(led_cdev);
+	if (!np)
+		return;
+
+	if (of_property_read_bool(np, "link"))
+		__set_bit(TRIGGER_NETDEV_LINK, &trigger_data->mode);
+	if (of_property_read_bool(np, "tx"))
+		__set_bit(TRIGGER_NETDEV_TX, &trigger_data->mode);
+	if (of_property_read_bool(np, "rx"))
+		__set_bit(TRIGGER_NETDEV_RX, &trigger_data->mode);
+	if (!of_property_read_string(np, "device-name", &device_name)) {
+		unsigned int len = strlen(device_name);
+
+		if (len < IFNAMSIZ)
+			set_device_name(trigger_data, device_name, len);
+	}
+	set_baseline_state(trigger_data);
+
+	of_node_put(np);
+}
+
 static int netdev_trig_activate(struct led_classdev *led_cdev)
 {
 	struct led_netdev_data *trigger_data;
@@ -726,6 +786,8 @@ static int netdev_trig_activate(struct led_classdev *led_cdev)
 				trigger_data->mode = mode;
 		}
 	}
+
+	netdev_trig_of_init(led_cdev, trigger_data);
 
 	led_set_trigger_data(led_cdev, trigger_data);
 

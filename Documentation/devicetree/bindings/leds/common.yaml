@@ -77,6 +77,20 @@ properties:
     description:
       This parameter, if present, is a string defining the trigger assigned to
       the LED.
+
+      If the trigger is "netdev", an optional child node "netdev" can be used
+      to configure initial values for the link, rx, tx and device-name
+      properties. For example:
+
+        netdev {
+            rx;
+            tx;
+            link;
+            device-name = "eth0";
+        };
+
+      This can be used to replace 'linux,default-trigger = "eth0-rxtx"' that
+      relies on the deprecated CONFIG_CAN_LEDS.
     $ref: /schemas/types.yaml#/definitions/string
 
     oneOf:

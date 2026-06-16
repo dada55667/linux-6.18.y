@@ -15,6 +15,28 @@
 	};
 };
 
+&led_amber {
+	linux,default-trigger = "netdev";
+
+	netdev {
+		link;
+		tx;
+		rx;
+		device-name = "eth0";
+	};
+};
+
+&led_blue {
+	linux,default-trigger = "netdev";
+
+	netdev {
+		link;
+		tx;
+		rx;
+		device-name = "eth1";
+	};
+};
+
 &i2c3 {
 	status = "okay";
 };
