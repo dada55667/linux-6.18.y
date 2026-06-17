@@ -1,24 +1,20 @@
 name: Build ARM64 Kernel & Release
 
 on:
-  workflow_dispatch:      # 允许手动触发
+  workflow_dispatch:
     inputs:
       tag_name:
-        description: "Release Tag (e.e. 6.18.0-20260616)"
+        description: "Release Tag (e.g. 6.18.0-20260616)"
         required: true
         default: "6.18.0-test"
-  push:
-    tags:
-      - "6.18.*"          # 推 v6.18.x tag 时自动触发
 
 jobs:
   build:
-    runs-on: ubuntu-latest
-
+    runs-on: ubuntu-24.04  # 使用 Ubuntu 24.04 获取更新的工具链
+    
     env:
       ARCH: arm64
       CROSS_COMPILE: aarch64-linux-gnu-
-      KERNEL_VERSION: ${{ github.event.inputs.tag_name || github.ref_name }}
 
     steps:
       - name: Checkout kernel source
@@ -32,33 +28,49 @@ jobs:
           sudo apt-get install -y \
             build-essential bison flex \
             libssl-dev libelf-dev \
-            gcc-aarch64-linux-gnu
+            gcc-13-aarch64-linux-gnu \
+            binutils-aarch64-linux-gnu \
+            kmod cpio
 
-      - name: Generate .config (替换为你实际的 defconfig 名)
+      - name: Setup cross-compiler
         run: |
+          sudo update-alternatives --install \
+            /usr/bin/aarch64-linux-gnu-gcc \
+            aarch64-linux-gnu-gcc \
+            /usr/bin/aarch64-linux-gnu-gcc-13 100
+          aarch64-linux-gnu-gcc --version
+
+      - name: Generate .config
+        run: |
+          rm -rf out
           make O=out ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- defconfig
-          # 如需额外开启选项可追加:
-          # make O=out ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- olddefconfig
+          
+          # 显示配置摘要
+          grep -c "=y" out/.config && echo "built-in options"
+          grep -c "=m" out/.config && echo "module options"
 
-      - name: Compile kernel & modules
+      - name: Build kernel (try without modules first)
         run: |
-          make O=out ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- -j$(nproc)
+          # 先只编译内核本身，不编译模块
+          make O=out ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- -j$(nproc) Image
+      
+      - name: Build modules (separate step)
+        run: |
+          make O=out ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- -j$(nproc) modules
           make O=out ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- modules_install INSTALL_MOD_PATH=./kernel-modules
 
       - name: Package artifacts
         run: |
           mkdir -p release
           cp out/arch/arm64/boot/Image release/
-          # 可选打包压缩模块
-          tar -czf release/kernel-modules.tar.gz -C kernel-modules lib
-          # 生成说明
-          echo "Kernel: $KERNEL_VERSION built $(date)" > release/README.txt
+          tar -czf release/kernel-modules.tar.gz -C kernel-modules lib 2>/dev/null || echo "No modules to package"
+          echo "Kernel: ${{ github.event.inputs.tag_name }} built $(date)" > release/README.txt
 
       - name: Create GitHub Release & Upload
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ env.KERNEL_VERSION }}
-          name: "Linux Kernel ${{ env.KERNEL_VERSION }} (arm64)"
+          tag_name: ${{ github.event.inputs.tag_name }}
+          name: "Linux Kernel ${{ github.event.inputs.tag_name }} (arm64)"
           files: |
             release/Image
             release/kernel-modules.tar.gz
