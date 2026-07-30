@@ -11,7 +11,7 @@
 / {
 	compatible = "amlogic,m302a", "amlogic,s905w", "amlogic,meson-gxl";
 	model = "Amlogic Meson GXL (S905L3b) MBH-M302A Box";
-	
+
 	memory@0 {
 		device_type = "memory";
 		reg = <0x0 0x0 0x0 0x80000000>;
@@ -40,9 +40,14 @@
 	cap-mmc-highspeed;
 	mmc-ddr-1_8v;
 	mmc-hs200-1_8v;
-	max-frequency = <200000000>;
+	max-frequency = <25000000>;
 };
 
 &internal_phy {
 	max-speed = <100>;
+};
+
+/* GXLX2: DW-HDMI is directly mapped at 0xda800000, not via the legacy 0xc883a000 window */
+&hdmi_tx {
+	reg = <0x0 0xda800000 0x0 0x10000>;
 };
