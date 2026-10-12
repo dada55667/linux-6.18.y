@@ -123,6 +123,25 @@
 	linux,rc-map-name = "rc-tanix-tx3mini";
 };
 
+/* Add GPIOX_17 as a second reset line for the BCM43342 Bluetooth */
+&sdio_pwrseq {
+	reset-gpios = <&gpio GPIOX_6 GPIO_ACTIVE_LOW>,
+		      <&gpio GPIOX_17 GPIO_ACTIVE_LOW>;
+};
+
+/* This is connected to the Bluetooth module: BCM43342 */
+&uart_A {
+	status = "okay";
+	pinctrl-0 = <&uart_a_pins>, <&uart_a_cts_rts_pins>;
+	pinctrl-names = "default";
+	uart-has-rtscts;
+
+	bluetooth {
+		compatible = "brcm,bcm4334-bt";
+		max-speed = <2000000>;
+	};
+};
+
 &usb {
 	dr_mode = "host";
 };

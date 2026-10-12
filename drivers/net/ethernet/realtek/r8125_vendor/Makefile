@@ -4,7 +4,7 @@
 # r8125 is the Linux device driver released for Realtek 2.5 Gigabit Ethernet
 # controllers with PCI-Express interface.
 #
-# Copyright(c) 2024 Realtek Semiconductor Corp. All rights reserved.
+# Copyright(c) 2026 Realtek Semiconductor Corp. All rights reserved.
 #
 # This program is free software; you can redistribute it and/or modify it
 # under the terms of the GNU General Public License as published by the Free
@@ -30,7 +30,7 @@
 #  US6,570,884, US6,115,776, and US6,327,625.
 ################################################################################
 
-# Modify by flippy(flippy@sina.com) 2026-01-31
+# Modify by flippy(flippy@sina.com) 2026-09-08
 
 ENABLE_LIB_SUPPORT = n
 ENABLE_RX_PACKET_FRAGMENT = n
@@ -51,10 +51,6 @@ endif
 ifeq ($(CONFIG_R8125_DASH_SUPPORT), y)
         r8125-objs += r8125_dash.o
         ccflags-y += -DENABLE_DASH_SUPPORT
-        ifeq ($(CONFIG_R8125_DASH_PRINT_SUPPORT), y)
-                r8125-objs += r8125_dash.o
-                ccflags-y += -DENABLE_DASH_SUPPORT -DENABLE_DASH_PRINTER_SUPPORT
-        endif
 endif
 
 ccflags-y += -DCONFIG_R8125_NAPI
@@ -107,9 +103,6 @@ endif
 ifeq ($(CONFIG_R8125_PTP_SUPPORT), y)
         r8125-objs += r8125_ptp.o
         ccflags-y += -DENABLE_PTP_SUPPORT
-        ifeq ($(CONFIG_R8125_PTP_MASTER_MODE), y)
-                ccflags-y += -DENABLE_PTP_MASTER_MODE
-        endif
 endif
 
 ifeq ($(ENABLE_LIB_SUPPORT), y)

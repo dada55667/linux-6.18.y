@@ -24,6 +24,16 @@ int esparser_power_up(struct amvdec_session *sess);
 int esparser_queue_eos(struct amvdec_core *core, const u8 *data, u32 len);
 
 /**
+ * esparser_replay_src() - write a retained OUTPUT buffer to the active VIFIFO
+ *
+ * @sess: active decoder session
+ * @vbuf: retained compressed OUTPUT buffer
+ * @parser_size: payload plus the padding previously added by the parser
+ */
+int esparser_replay_src(struct amvdec_session *sess,
+			struct vb2_v4l2_buffer *vbuf, u32 parser_size);
+
+/**
  * esparser_queue_all_src() - work handler that writes as many src buffers
  * as possible to the ESPARSER
  *

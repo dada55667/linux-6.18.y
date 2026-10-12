@@ -375,3 +375,7 @@
 	phys = <&usb2_phy0>, <&usb2_phy1>;
 	phy-names = "usb2-phy0", "usb2-phy1";
 };
+
+&vdec {
+	compatible = "amlogic,g12b-vdec", "amlogic,g12a-vdec";
+};

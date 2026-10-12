@@ -53,9 +53,6 @@
 #define SEARCH_PATTERN_LEN	512
 #define VP9_HEADER_SIZE		16
 
-static DECLARE_WAIT_QUEUE_HEAD(wq);
-static int search_done;
-
 static irqreturn_t esparser_isr(int irq, void *dev)
 {
 	int int_status;
@@ -67,8 +64,8 @@ static irqreturn_t esparser_isr(int irq, void *dev)
 	if (int_status & PARSER_INTSTAT_SC_FOUND) {
 		amvdec_write_parser(core, PFIFO_RD_PTR, 0);
 		amvdec_write_parser(core, PFIFO_WR_PTR, 0);
-		search_done = 1;
-		wake_up_interruptible(&wq);
+		WRITE_ONCE(core->esparser_search_done, true);
+		wake_up_interruptible(&core->esparser_wq);
 	}
 
 	return IRQ_HANDLED;
@@ -224,12 +221,14 @@ esparser_write_data(struct amvdec_core *core, dma_addr_t addr, u32 size)
 			    (size << ES_PACK_SIZE_BIT));
 
 	amvdec_write_parser(core, PARSER_FETCH_ADDR, addr);
+	WRITE_ONCE(core->esparser_search_done, false);
 	amvdec_write_parser(core, PARSER_FETCH_CMD,
-			    (7 << FETCH_ENDIAN_BIT) |
-			    (size + SEARCH_PATTERN_LEN));
+				    (7 << FETCH_ENDIAN_BIT) |
+				    (size + SEARCH_PATTERN_LEN));
 
-	search_done = 0;
-	return wait_event_interruptible_timeout(wq, search_done, (HZ / 5));
+	return wait_event_interruptible_timeout(core->esparser_wq,
+						READ_ONCE(core->esparser_search_done),
+						HZ / 5);
 }
 
 static u32 esparser_vififo_get_free_space(struct amvdec_session *sess)
@@ -265,7 +264,9 @@ int esparser_queue_eos(struct amvdec_core *core, const u8 *data, u32 len)
 		return -ENOMEM;
 
 	memcpy(eos_vaddr, data, len);
+	mutex_lock(&core->parser_lock);
 	ret = esparser_write_data(core, eos_paddr, len);
+	mutex_unlock(&core->parser_lock);
 	dma_free_coherent(dev, len + SEARCH_PATTERN_LEN,
 			  eos_vaddr, eos_paddr);
 
@@ -288,7 +289,9 @@ static u32 esparser_get_offset(struct amvdec_session *sess)
 }
 
 static int
-esparser_queue(struct amvdec_session *sess, struct vb2_v4l2_buffer *vbuf)
+esparser_queue_locked(struct amvdec_session *sess,
+		      struct vb2_v4l2_buffer *vbuf, bool *input_queued,
+		      u32 *queued_payload_size, u32 *queued_parser_size)
 {
 	int ret;
 	struct vb2_buffer *vb = &vbuf->vb2_buf;
@@ -299,7 +302,9 @@ esparser_queue(struct amvdec_session *sess, struct vb2_v4l2_buffer *vbuf)
 	u32 num_dst_bufs = 0;
 	u32 offset;
 	u32 pad_size;
-	u32 wp, wp2;
+	if (codec_ops->can_queue_input &&
+	    !codec_ops->can_queue_input(sess))
+		return -EAGAIN;
 
 	/*
 	 * When max ref frame is held by VP9, this should be -= 3 to prevent a
@@ -309,18 +314,20 @@ esparser_queue(struct amvdec_session *sess, struct vb2_v4l2_buffer *vbuf)
 	 * they could pause when there is no capture buffer available and
 	 * resume on this notification.
 	 */
-	if (sess->fmt_out->pixfmt == V4L2_PIX_FMT_VP9 ||
-	    sess->fmt_out->pixfmt == V4L2_PIX_FMT_HEVC) {
+	if ((sess->fmt_out->pixfmt == V4L2_PIX_FMT_VP9 ||
+	     sess->fmt_out->pixfmt == V4L2_PIX_FMT_HEVC) &&
+	    sess->streamon_cap) {
 		if (codec_ops->num_pending_bufs)
 			num_dst_bufs = codec_ops->num_pending_bufs(sess);
 
 		num_dst_bufs += v4l2_m2m_num_dst_bufs_ready(sess->m2m_ctx);
+		if (num_dst_bufs <= 3)
+			return -EAGAIN;
 		num_dst_bufs -= 3;
 
 		if (esparser_vififo_get_free_space(sess) < payload_size ||
 		    atomic_read(&sess->esparser_queued_bufs) >= num_dst_bufs)
 			return -EAGAIN;
-
 	} else if (esparser_vififo_get_free_space(sess) < payload_size) {
 		return -EAGAIN;
 	}
@@ -355,52 +362,153 @@ esparser_queue(struct amvdec_session *sess, struct vb2_v4l2_buffer *vbuf)
 	}
 
 	pad_size = esparser_pad_start_code(core, vb, payload_size);
-	wp = amvdec_read_parser(core, PARSER_VIDEO_WP);
 	ret = esparser_write_data(core, phy, payload_size + pad_size);
-	wp2 = amvdec_read_parser(core, PARSER_VIDEO_WP);
 
 	if (ret <= 0) {
+		dev_warn(core->dev, "esparser: input parsing error\n");
+		amvdec_remove_ts(sess, vb->timestamp);
+		v4l2_m2m_buf_done(vbuf, VB2_BUF_STATE_ERROR);
 		amvdec_write_parser(core, PARSER_FETCH_CMD, 0);
 
-		if (ret < 0 || wp2 == wp) {
-			dev_err(core->dev, "esparser: input parsing error ret %d (%x <=> %x)\n",
-				ret, wp, wp2);
-			amvdec_remove_ts(sess, vb->timestamp);
-			v4l2_m2m_buf_done(vbuf, VB2_BUF_STATE_ERROR);
-
-			return 0;
-		}
+		return 0;
 	}
 
 	atomic_inc(&sess->esparser_queued_bufs);
-	v4l2_m2m_buf_done(vbuf, VB2_BUF_STATE_DONE);
+	*input_queued = true;
+	*queued_payload_size = payload_size;
+	*queued_parser_size = payload_size + pad_size;
 
 	return 0;
 }
 
+int esparser_replay_src(struct amvdec_session *sess,
+			struct vb2_v4l2_buffer *vbuf, u32 parser_size)
+{
+	struct amvdec_core *core = sess->core;
+	dma_addr_t phy;
+	int ret;
+
+	if (!vbuf || !parser_size)
+		return -EINVAL;
+	if (!amvdec_session_is_current(sess))
+		return -EAGAIN;
+
+	phy = vb2_dma_contig_plane_dma_addr(&vbuf->vb2_buf, 0);
+	mutex_lock(&core->parser_lock);
+	ret = esparser_write_data(core, phy, parser_size);
+	if (ret <= 0)
+		amvdec_write_parser(core, PARSER_FETCH_CMD, 0);
+	mutex_unlock(&core->parser_lock);
+	if (ret > 0)
+		return 0;
+
+	return ret ? ret : -ETIMEDOUT;
+}
+
+static int
+esparser_queue(struct amvdec_session *sess, struct vb2_v4l2_buffer *vbuf)
+{
+	struct amvdec_codec_ops *codec_ops = sess->fmt_out->codec_ops;
+	u32 payload_size = 0;
+	u32 parser_size = 0;
+	bool input_queued = false;
+	int ret;
+
+	mutex_lock(&sess->core->parser_lock);
+	ret = esparser_queue_locked(sess, vbuf, &input_queued, &payload_size,
+				    &parser_size);
+	mutex_unlock(&sess->core->parser_lock);
+
+	if (input_queued) {
+		if (codec_ops->input_queued_buf) {
+			codec_ops->input_queued_buf(sess, vbuf, payload_size,
+						    parser_size);
+		} else {
+			v4l2_m2m_buf_done(vbuf, VB2_BUF_STATE_DONE);
+			if (codec_ops->input_queued)
+				codec_ops->input_queued(sess, payload_size);
+		}
+	}
+
+	return ret;
+}
+
 void esparser_queue_all_src(struct work_struct *work)
 {
-	struct v4l2_m2m_buffer *buf, *n;
 	struct amvdec_session *sess =
 		container_of(work, struct amvdec_session, esparser_queue_work);
+	struct amvdec_core *core = sess->core;
+	struct vb2_v4l2_buffer *vbuf;
+	struct amvdec_codec_ops *codec_ops = sess->fmt_out->codec_ops;
+	bool codec_job = false;
+	int ret;
+	bool finish = false;
+	bool queue_next = false;
+
+	if (atomic_read(&sess->m2m_job_running) != AMVDEC_M2M_JOB_RUNNING)
+		return;
+	if (codec_ops->has_pending_job && codec_ops->job_ready)
+		codec_job = codec_ops->has_pending_job(sess) &&
+			codec_ops->job_ready(sess);
+
+	ret = amvdec_m2m_job_start(sess);
+	if (ret == -ECANCELED)
+		return;
+	if (ret) {
+		dev_err(sess->core->dev,
+			"failed to acquire decoder hardware: %d\n", ret);
+		amvdec_abort(sess);
+		amvdec_m2m_job_finish(sess);
+		return;
+	}
 
 	mutex_lock(&sess->lock);
-	v4l2_m2m_for_each_src_buf_safe(sess->m2m_ctx, buf, n) {
-		if (sess->should_stop)
-			break;
-
-		if (esparser_queue(sess, &buf->vb) < 0)
-			break;
+	if (atomic_read(&sess->m2m_job_running) != AMVDEC_M2M_JOB_RUNNING) {
+		mutex_unlock(&sess->lock);
+		return;
+	}
+	vbuf = v4l2_m2m_next_src_buf(sess->m2m_ctx);
+	if (sess->should_stop) {
+		finish = true;
+	} else if (!vbuf) {
+		finish = !codec_job;
+	} else {
+		mutex_lock(&core->hw_lock);
+		if (atomic_read(&sess->m2m_job_running) !=
+		    AMVDEC_M2M_JOB_RUNNING ||
+		    !amvdec_session_is_current(sess)) {
+			mutex_unlock(&core->hw_lock);
+			mutex_unlock(&sess->lock);
+			return;
+		}
+		ret = esparser_queue(sess, vbuf);
+		mutex_unlock(&core->hw_lock);
+		/* Only a full VIFIFO is retryable with the same source buffer. */
+		finish = ret != -EAGAIN;
+		if (!ret && codec_ops->context_switching) {
+			finish = false;
+			queue_next =
+				v4l2_m2m_num_src_bufs_ready(sess->m2m_ctx) > 0;
+		}
 	}
 	mutex_unlock(&sess->lock);
+
+	if (finish)
+		amvdec_m2m_job_finish(sess);
+	else if (queue_next)
+		schedule_work(&sess->esparser_queue_work);
 }
 
 int esparser_power_up(struct amvdec_session *sess)
 {
 	struct amvdec_core *core = sess->core;
 	struct amvdec_ops *vdec_ops = sess->fmt_out->vdec_ops;
+	int ret;
 
-	reset_control_reset(core->esparser_reset);
+	ret = reset_control_reset(core->esparser_reset);
+	if (ret)
+		return ret;
+
 	amvdec_write_parser(core, PARSER_CONFIG,
 			    (10 << PS_CFG_PFIFO_EMPTY_CNT_BIT) |
 			    (1  << PS_CFG_MAX_ES_WR_CYCLE_BIT) |
@@ -425,6 +533,9 @@ int esparser_power_up(struct amvdec_session *sess)
 	amvdec_write_parser(core, PARSER_VIDEO_START_PTR, sess->vififo_paddr);
 	amvdec_write_parser(core, PARSER_VIDEO_END_PTR,
 			    sess->vififo_paddr + sess->vififo_size - 8);
+	amvdec_write_parser(core, PARSER_VIDEO_WP,
+			    sess->vififo_context_valid ?
+			    sess->vififo_wp : sess->vififo_paddr);
 	amvdec_write_parser(core, PARSER_ES_CONTROL,
 			    amvdec_read_parser(core, PARSER_ES_CONTROL) & ~1);
 
@@ -443,6 +554,8 @@ int esparser_init(struct platform_device *pdev, struct amvdec_core *core)
 	struct device *dev = &pdev->dev;
 	int ret;
 	int irq;
+
+	init_waitqueue_head(&core->esparser_wq);
 
 	irq = platform_get_irq_byname(pdev, "esparser");
 	if (irq < 0)

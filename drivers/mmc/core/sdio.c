@@ -7,6 +7,7 @@
 
 #include <linux/err.h>
 #include <linux/pm_runtime.h>
+#include <linux/property.h>
 #include <linux/sysfs.h>
 
 #include <linux/mmc/host.h>
@@ -661,10 +662,14 @@ static int mmc_sdio_init_card(struct mmc_host *host, u32 ocr,
 			      struct mmc_card *oldcard)
 {
 	struct mmc_card *card;
+	bool fixed_1_8v;
 	int err;
 	int retries = 10;
 	u32 rocr = 0;
 	u32 ocr_card = ocr;
+
+	fixed_1_8v = device_property_read_bool(mmc_dev(host),
+						"zte,sdio-fixed-1-8v");
 
 	WARN_ON(!host->claimed);
 
@@ -740,7 +745,14 @@ try_again:
 	 * to make sure which speed mode should work.
 	 */
 	if (rocr & ocr & R4_18V_PRESENT) {
-		err = mmc_set_uhs_voltage(host, ocr_card);
+		if (fixed_1_8v &&
+		    host->ios.signal_voltage == MMC_SIGNAL_VOLTAGE_180) {
+			dev_dbg(mmc_dev(host),
+				 "fixed 1.8V SDIO rail, skipping CMD11 voltage switch\n");
+			err = 0;
+		} else {
+			err = mmc_set_uhs_voltage(host, ocr_card);
+		}
 		if (err == -EAGAIN) {
 			mmc_sdio_pre_init(host, ocr_card, card);
 			retries--;
@@ -1333,4 +1345,3 @@ err:
 
 	return err;
 }
-

@@ -31,6 +31,15 @@ properties:
   reset-gpios:
     maxItems: 1
 
+  motorcomm,bdy-g98-led-profile:
+    type: boolean
+    description:
+      Apply the bdy-g98 board RJ45 LED profile to all user ports after chip
+      reset. Both LEDs of each jack are tied to one electrical net on this
+      board, so they always show the same thing: solid on link at any
+      speed, blinking on RX/TX activity, dark while unlinked.
+      Vendor-specific, only meaningful on bdy-g98 hardware.
+
   mdio:
     $ref: /schemas/net/mdio.yaml#
     unevaluatedProperties: false

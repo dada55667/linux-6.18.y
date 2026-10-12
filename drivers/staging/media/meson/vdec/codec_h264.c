@@ -16,7 +16,7 @@
 #define SIZE_SEI	(8 * SZ_1K)
 
 /*
- * Offset added by the firmware which must be substracted
+ * Offset added by the firmware which must be subtracted
  * from the workspace phyaddr
  */
 #define WORKSPACE_BUF_OFFSET	0x1000000
@@ -34,11 +34,6 @@
 /* Picture type */
 #define PIC_TOP_BOT	5
 #define PIC_BOT_TOP	6
-
-/* Slice type */
-#define SLICE_TYPE_I 2
-#define SLICE_TYPE_P 5
-#define SLICE_TYPE_B 6
 
 /* Size of Motion Vector per macroblock */
 #define MB_MV_SIZE	96
@@ -287,15 +282,18 @@ static void codec_h264_set_par(struct amvdec_session *sess)
 	sess->pixelaspect = par_table[ar_idc];
 }
 
-static void codec_h264_resume(struct amvdec_session *sess)
+static int codec_h264_resume(struct amvdec_session *sess)
 {
 	struct amvdec_core *core = sess->core;
 	struct codec_h264 *h264 = sess->priv;
 	u32 mb_width, mb_height, mb_total;
 
-	amvdec_set_canvases(sess,
-			    (u32[]){ ANC0_CANVAS_ADDR, 0 },
-			    (u32[]){ 24, 0 });
+	if (sess->canvas_reg_count)
+		amvdec_restore_canvases(sess);
+	else
+		amvdec_set_canvases(sess,
+				    (u32[]){ ANC0_CANVAS_ADDR, 0 },
+				    (u32[]){ 24, 0 });
 
 	dev_dbg(core->dev, "max_refs = %u; actual_dpb_size = %u\n",
 		h264->max_refs, sess->num_dst_bufs);
@@ -310,7 +308,7 @@ static void codec_h264_resume(struct amvdec_session *sess)
 					     &h264->ref_paddr, GFP_KERNEL);
 	if (!h264->ref_vaddr) {
 		amvdec_abort(sess);
-		return;
+		return -ENOMEM;
 	}
 
 	/* Address to store the references' MVs */
@@ -321,6 +319,8 @@ static void codec_h264_resume(struct amvdec_session *sess)
 	amvdec_write_dos(core, AV_SCRATCH_0, (h264->max_refs << 24) |
 					     (sess->num_dst_bufs << 16) |
 					     ((h264->max_refs - 1) << 8));
+
+	return 0;
 }
 
 /*
@@ -358,8 +358,7 @@ static void codec_h264_src_change(struct amvdec_session *sess)
 		frame_width, frame_height, crop_right, crop_bottom);
 
 	codec_h264_set_par(sess);
-	amvdec_src_change(sess, frame_width, frame_height,
-			  h264->max_refs + 5, 8);
+	amvdec_src_change(sess, frame_width, frame_height, h264->max_refs + 5, 8);
 }
 
 /*
@@ -398,11 +397,8 @@ static void codec_h264_frames_ready(struct amvdec_session *sess, u32 status)
 		u32 buffer_index = frame_status & BUF_IDX_MASK;
 		u32 pic_struct = (frame_status >> PIC_STRUCT_BIT) &
 				 PIC_STRUCT_MASK;
-		u32 idr_flag = (frame_status & 0x400);
 		u32 offset = (frame_status >> OFFSET_BIT) & OFFSET_MASK;
 		u32 field = V4L2_FIELD_NONE;
-		u32 slice_type = (amvdec_read_dos(core, AV_SCRATCH_H) >> (i * 4)) & 0xf;
-		u32 type = 0;
 
 		/*
 		 * A buffer decode error means it was decoded,
@@ -418,17 +414,8 @@ static void codec_h264_frames_ready(struct amvdec_session *sess, u32 status)
 		else if (pic_struct == PIC_BOT_TOP)
 			field = V4L2_FIELD_INTERLACED_BT;
 
-		if (idr_flag)
-			type = 4;
-		else if (slice_type == SLICE_TYPE_I)
-			type = 1;
-		else if (slice_type == SLICE_TYPE_P)
-			type = 2;
-		else if (slice_type == SLICE_TYPE_B || slice_type == 8)
-			type = 3;
-
 		offset |= get_offset_msb(core, i);
-		amvdec_dst_buf_done_idx(sess, buffer_index, offset, field, type);
+		amvdec_dst_buf_done_idx(sess, buffer_index, offset, field, 0);
 	}
 }
 

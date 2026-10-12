@@ -11,6 +11,7 @@
 #include <linux/platform_device.h>
 #include <linux/mfd/syscon.h>
 #include <linux/slab.h>
+#include <linux/string.h>
 #include <linux/interrupt.h>
 #include <linux/kthread.h>
 #include <media/v4l2-ioctl.h>
@@ -31,17 +32,70 @@ struct dummy_buf {
 
 /* 16 MiB for parsed bitstream swap exchange */
 #define SIZE_VIFIFO SZ_16M
+#define VDEC_INACTIVE_TIMEOUT_MS 1000
 
-static u32 get_output_size(u32 width, u32 height)
+static u32 get_output_size(const struct amvdec_codec_ops *codec_ops,
+			   u32 width, u32 height)
 {
+	if (codec_ops->canvas_height_align)
+		return ALIGN(width, 64) *
+			ALIGN(height, codec_ops->canvas_height_align);
+
 	return ALIGN(width * height, SZ_64K);
 }
 
 u32 amvdec_get_output_size(struct amvdec_session *sess)
 {
-	return get_output_size(sess->width, sess->height);
+	return get_output_size(sess->fmt_out->codec_ops,
+			       sess->width, sess->height);
 }
 EXPORT_SYMBOL_GPL(amvdec_get_output_size);
+
+static void vdec_set_current_session(struct amvdec_core *core,
+				     struct amvdec_session *sess)
+{
+	unsigned long flags;
+
+	lockdep_assert_held(&core->hw_lock);
+
+	spin_lock_irqsave(&core->irq_lock, flags);
+	core->cur_sess = sess;
+	spin_unlock_irqrestore(&core->irq_lock, flags);
+}
+
+static int vdec_session_irq(struct amvdec_session *sess)
+{
+	return sess->core->irqs[sess->fmt_out->codec_ops->irq];
+}
+
+static struct amvdec_session *
+vdec_get_current_session(struct amvdec_core *core)
+{
+	struct amvdec_session *sess;
+	unsigned long flags;
+
+	spin_lock_irqsave(&core->irq_lock, flags);
+	sess = core->cur_sess;
+	spin_unlock_irqrestore(&core->irq_lock, flags);
+
+	return sess;
+}
+
+bool amvdec_session_is_current(struct amvdec_session *sess)
+{
+	return vdec_get_current_session(sess->core) == sess;
+}
+
+static struct amvdec_session *
+vdec_current_session(struct amvdec_core *core, int irq)
+{
+	struct amvdec_session *sess = vdec_get_current_session(core);
+
+	if (sess && vdec_session_irq(sess) != irq)
+		return NULL;
+
+	return sess;
+}
 
 static int vdec_codec_needs_recycle(struct amvdec_session *sess)
 {
@@ -79,6 +133,10 @@ static int vdec_poweron(struct amvdec_session *sess)
 {
 	int ret;
 	struct amvdec_ops *vdec_ops = sess->fmt_out->vdec_ops;
+	struct amvdec_codec_ops *codec_ops = sess->fmt_out->codec_ops;
+
+	WRITE_ONCE(sess->hardware_stalled, false);
+	WRITE_ONCE(sess->irq_seen, false);
 
 	ret = clk_prepare_enable(sess->core->dos_parser_clk);
 	if (ret)
@@ -89,10 +147,29 @@ static int vdec_poweron(struct amvdec_session *sess)
 		goto disable_dos_parser;
 
 	ret = vdec_ops->start(sess);
-	if (ret)
+	if (ret) {
+		if (codec_ops->release && sess->priv)
+			codec_ops->release(sess);
 		goto disable_dos;
+	}
 
-	esparser_power_up(sess);
+	ret = esparser_power_up(sess);
+	if (ret) {
+		vdec_ops->stop(sess);
+		if (codec_ops->release && sess->priv)
+			codec_ops->release(sess);
+		goto disable_dos;
+	}
+
+	if (codec_ops->run) {
+		ret = codec_ops->run(sess);
+		if (ret) {
+			vdec_ops->stop(sess);
+			if (codec_ops->release && sess->priv)
+				codec_ops->release(sess);
+			goto disable_dos;
+		}
+	}
 
 	return 0;
 
@@ -104,17 +181,72 @@ disable_dos_parser:
 	return ret;
 }
 
+static int vdec_resume(struct amvdec_session *sess, bool reload_firmware)
+{
+	struct amvdec_ops *vdec_ops = sess->fmt_out->vdec_ops;
+	struct amvdec_codec_ops *codec_ops = sess->fmt_out->codec_ops;
+	int ret;
+
+	WRITE_ONCE(sess->hardware_stalled, false);
+	WRITE_ONCE(sess->irq_seen, false);
+
+	ret = vdec_ops->resume(sess, reload_firmware);
+	if (ret)
+		return ret;
+
+	ret = esparser_power_up(sess);
+	if (ret)
+		return ret;
+	if (codec_ops->run)
+		return codec_ops->run(sess);
+
+	return 0;
+}
+
+static void vdec_stop_hardware(struct amvdec_session *sess)
+{
+	sess->fmt_out->vdec_ops->stop(sess);
+	clk_disable_unprepare(sess->core->dos_clk);
+	clk_disable_unprepare(sess->core->dos_parser_clk);
+}
+
+static void vdec_stop_suspended_hardware(struct amvdec_session *sess)
+{
+	struct amvdec_ops *vdec_ops = sess->fmt_out->vdec_ops;
+
+	if (vdec_ops->stop_suspended)
+		vdec_ops->stop_suspended(sess);
+	else
+		vdec_ops->stop(sess);
+	clk_disable_unprepare(sess->core->dos_clk);
+	clk_disable_unprepare(sess->core->dos_parser_clk);
+}
+
 static void vdec_wait_inactive(struct amvdec_session *sess)
 {
+	u64 deadline = get_jiffies_64() +
+		msecs_to_jiffies(VDEC_INACTIVE_TIMEOUT_MS);
+	bool stalled;
+
 	/* We consider 50ms with no IRQ to be inactive. */
 	while (time_is_after_jiffies64(sess->last_irq_jiffies +
-				       msecs_to_jiffies(50)))
+				       msecs_to_jiffies(50)) &&
+	       time_before64(get_jiffies_64(), deadline))
 		msleep(25);
+
+	stalled = READ_ONCE(sess->irq_seen) &&
+		  time_is_after_jiffies64(sess->last_irq_jiffies +
+					 msecs_to_jiffies(50));
+	WRITE_ONCE(sess->hardware_stalled, stalled);
+
+	if (stalled)
+		dev_warn(sess->core->dev,
+			 "decoder did not become inactive within %u ms\n",
+			 VDEC_INACTIVE_TIMEOUT_MS);
 }
 
 static void vdec_poweroff(struct amvdec_session *sess)
 {
-	struct amvdec_ops *vdec_ops = sess->fmt_out->vdec_ops;
 	struct amvdec_codec_ops *codec_ops = sess->fmt_out->codec_ops;
 
 	sess->should_stop = 1;
@@ -122,9 +254,33 @@ static void vdec_poweroff(struct amvdec_session *sess)
 	if (codec_ops->drain)
 		codec_ops->drain(sess);
 
-	vdec_ops->stop(sess);
-	clk_disable_unprepare(sess->core->dos_clk);
-	clk_disable_unprepare(sess->core->dos_parser_clk);
+	vdec_stop_hardware(sess);
+	if (codec_ops->release && sess->priv)
+		codec_ops->release(sess);
+}
+
+static void vdec_poweroff_suspended(struct amvdec_session *sess)
+{
+	struct amvdec_codec_ops *codec_ops = sess->fmt_out->codec_ops;
+
+	sess->should_stop = 1;
+	if (codec_ops->drain)
+		codec_ops->drain(sess);
+	vdec_stop_suspended_hardware(sess);
+	if (codec_ops->release && sess->priv)
+		codec_ops->release(sess);
+}
+
+static void vdec_suspend(struct amvdec_session *sess)
+{
+	struct amvdec_ops *vdec_ops = sess->fmt_out->vdec_ops;
+
+	if (vdec_ops->suspend && vdec_ops->resume) {
+		vdec_ops->suspend(sess);
+		return;
+	}
+
+	vdec_stop_hardware(sess);
 }
 
 static void
@@ -146,18 +302,216 @@ static void vdec_m2m_device_run(void *priv)
 {
 	struct amvdec_session *sess = priv;
 
+	atomic_set(&sess->m2m_job_running, AMVDEC_M2M_JOB_RUNNING);
 	schedule_work(&sess->esparser_queue_work);
+}
+
+int amvdec_m2m_job_start(struct amvdec_session *sess)
+{
+	struct amvdec_codec_ops *codec_ops = sess->fmt_out->codec_ops;
+	struct amvdec_core *core = sess->core;
+	struct amvdec_session *hw_sess;
+	struct amvdec_session **hw_slot;
+	bool reload_firmware = false;
+	int irq = vdec_session_irq(sess);
+	int ret = 0;
+
+	if (!codec_ops->context_switching)
+		return 0;
+	if (irq < 0)
+		return irq;
+
+	disable_irq(irq);
+	mutex_lock(&core->hw_lock);
+	if (atomic_read(&sess->m2m_job_running) != AMVDEC_M2M_JOB_RUNNING) {
+		ret = -ECANCELED;
+		goto unlock;
+	}
+	if (amvdec_session_is_current(sess))
+		goto unlock;
+	if (vdec_get_current_session(core)) {
+		ret = -EBUSY;
+		goto unlock;
+	}
+
+	hw_slot = &core->hw_sess[sess->fmt_out->vdec_ops->hw];
+	hw_sess = *hw_slot;
+	if (hw_sess)
+		reload_firmware = strcmp(hw_sess->fmt_out->firmware_path,
+					 sess->fmt_out->firmware_path);
+
+	vdec_set_current_session(core, sess);
+	if (hw_sess)
+		ret = vdec_resume(sess, reload_firmware);
+	else
+		ret = vdec_poweron(sess);
+	if (ret) {
+		vdec_set_current_session(core, NULL);
+		if (hw_sess) {
+			vdec_stop_hardware(sess);
+			*hw_slot = NULL;
+		}
+		goto unlock;
+	}
+	*hw_slot = sess;
+
+unlock:
+	mutex_unlock(&core->hw_lock);
+	enable_irq(irq);
+	return ret;
+}
+
+static void vdec_m2m_release_hardware(struct amvdec_session *sess,
+				      bool synchronize)
+{
+	struct amvdec_core *core = sess->core;
+	struct amvdec_session **hw_slot;
+	bool is_current;
+	int irq = vdec_session_irq(sess);
+
+	hw_slot = &core->hw_sess[sess->fmt_out->vdec_ops->hw];
+
+	if (synchronize)
+		disable_irq(irq);
+
+	mutex_lock(&core->hw_lock);
+	is_current = amvdec_session_is_current(sess);
+	if (is_current || (synchronize && *hw_slot == sess)) {
+		if (synchronize) {
+			if (is_current)
+				vdec_stop_hardware(sess);
+			else
+				vdec_stop_suspended_hardware(sess);
+			*hw_slot = NULL;
+		} else if (sess->should_stop) {
+			vdec_stop_hardware(sess);
+			*hw_slot = NULL;
+		} else {
+			vdec_suspend(sess);
+			if (!sess->fmt_out->vdec_ops->resume)
+				*hw_slot = NULL;
+		}
+		if (is_current)
+			vdec_set_current_session(core, NULL);
+	}
+	mutex_unlock(&core->hw_lock);
+
+	if (synchronize)
+		enable_irq(irq);
+}
+
+static bool vdec_m2m_finish_drain(struct amvdec_session *sess)
+{
+	struct amvdec_codec_ops *codec_ops = sess->fmt_out->codec_ops;
+
+	if (!codec_ops->async_drain || !READ_ONCE(sess->draining) ||
+	    atomic_read(&sess->m2m_job_running) != AMVDEC_M2M_JOB_IDLE ||
+	    v4l2_m2m_num_src_bufs_ready(sess->m2m_ctx) ||
+	    (codec_ops->has_pending_job && codec_ops->has_pending_job(sess)))
+		return false;
+
+	if (cmpxchg(&sess->draining, 1U, 0U) != 1U)
+		return false;
+
+	sess->should_stop = 1;
+	if (codec_ops->drain)
+		codec_ops->drain(sess);
+	v4l2_m2m_mark_stopped(sess->m2m_ctx);
+
+	return true;
+}
+
+bool amvdec_m2m_begin_yield(struct amvdec_session *sess)
+{
+	return atomic_cmpxchg(&sess->m2m_job_running,
+			      AMVDEC_M2M_JOB_RUNNING,
+			      AMVDEC_M2M_JOB_COMPLETING) ==
+		AMVDEC_M2M_JOB_RUNNING;
+}
+
+static void vdec_m2m_complete_started_job(struct amvdec_session *sess,
+					  bool synchronize)
+{
+	if (sess->fmt_out->codec_ops->context_switching)
+		vdec_m2m_release_hardware(sess, synchronize);
+	atomic_set(&sess->m2m_job_running, AMVDEC_M2M_JOB_IDLE);
+	vdec_m2m_finish_drain(sess);
+
+	v4l2_m2m_job_finish(sess->core->m2m_dev, sess->m2m_ctx);
+}
+
+static void vdec_m2m_complete_job(struct amvdec_session *sess,
+				  bool synchronize)
+{
+	if (!amvdec_m2m_begin_yield(sess))
+		return;
+
+	vdec_m2m_complete_started_job(sess, synchronize);
+}
+
+void amvdec_m2m_finish_yield(struct amvdec_session *sess)
+{
+	if (WARN_ON_ONCE(atomic_read(&sess->m2m_job_running) !=
+			 AMVDEC_M2M_JOB_COMPLETING))
+		return;
+
+	vdec_m2m_complete_started_job(sess, false);
+}
+
+void amvdec_m2m_job_finish(struct amvdec_session *sess)
+{
+	vdec_m2m_complete_job(sess, true);
+}
+
+void amvdec_m2m_job_yield(struct amvdec_session *sess)
+{
+	vdec_m2m_complete_job(sess, false);
+}
+
+void amvdec_m2m_retry_job(struct amvdec_session *sess)
+{
+	if (atomic_read(&sess->m2m_job_running) == AMVDEC_M2M_JOB_RUNNING)
+		schedule_work(&sess->esparser_queue_work);
 }
 
 static void vdec_m2m_job_abort(void *priv)
 {
 	struct amvdec_session *sess = priv;
 
-	v4l2_m2m_job_finish(sess->m2m_dev, sess->m2m_ctx);
+	/* The queue lock may be held while the worker is waiting for it. */
+	cancel_work(&sess->esparser_queue_work);
+	amvdec_m2m_job_finish(sess);
+}
+
+static int vdec_m2m_job_ready(void *priv)
+{
+	struct amvdec_session *sess = priv;
+	struct amvdec_codec_ops *codec_ops = sess->fmt_out->codec_ops;
+	bool src_ready;
+
+	if (READ_ONCE(sess->source_change_pending))
+		return 0;
+
+	if (!sess->streamon_out)
+		return 0;
+	if (codec_ops->has_pending_job &&
+	    codec_ops->has_pending_job(sess))
+		return sess->streamon_cap && codec_ops->job_ready &&
+			codec_ops->job_ready(sess);
+
+	src_ready = v4l2_m2m_num_src_bufs_ready(sess->m2m_ctx) > 0;
+	if (!src_ready)
+		return 0;
+
+	if (sess->status == STATUS_INIT && !sess->streamon_cap)
+		return src_ready;
+
+	return src_ready && sess->streamon_cap;
 }
 
 static const struct v4l2_m2m_ops vdec_m2m_ops = {
 	.device_run = vdec_m2m_device_run,
+	.job_ready = vdec_m2m_job_ready,
 	.job_abort = vdec_m2m_job_abort,
 };
 
@@ -171,19 +525,18 @@ static void process_num_buffers(struct vb2_queue *q,
 	unsigned int buffers_total = q_num_bufs + *num_buffers;
 	u32 min_buf_capture = v4l2_ctrl_g_ctrl(sess->ctrl_min_buf_capture);
 
-	if (q_num_bufs + *num_buffers < min_buf_capture)
-		*num_buffers = min_buf_capture - q_num_bufs;
-	if (is_reqbufs && buffers_total < fmt_out->min_buffers)
-		*num_buffers = fmt_out->min_buffers - q_num_bufs;
-	if (buffers_total > fmt_out->max_buffers)
-		*num_buffers = fmt_out->max_buffers - q_num_bufs;
+	buffers_total = max(buffers_total, min_buf_capture);
+	if (is_reqbufs)
+		buffers_total = max(buffers_total, fmt_out->min_buffers);
+	buffers_total = min(buffers_total, fmt_out->max_buffers);
+	*num_buffers = buffers_total - q_num_bufs;
 
 	/* We need to program the complete CAPTURE buffer list
 	 * in registers during start_streaming, and the firmwares
 	 * are free to choose any of them to write frames to. As such,
 	 * we need all of them to be queued into the driver
 	 */
-	sess->num_dst_bufs = q_num_bufs + *num_buffers;
+	sess->num_dst_bufs = buffers_total;
 	q->min_queued_buffers = max(fmt_out->min_buffers, sess->num_dst_bufs);
 }
 
@@ -203,6 +556,11 @@ static int vdec_queue_setup(struct vb2_queue *q, unsigned int *num_buffers,
 			break;
 		case V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE:
 			switch (sess->pixfmt_cap) {
+			case V4L2_PIX_FMT_NV12:
+				if (*num_planes != 1 ||
+				    sizes[0] < output_size + output_size / 2)
+					return -EINVAL;
+				break;
 			case V4L2_PIX_FMT_NV12M:
 				if (*num_planes != 2 ||
 				    sizes[0] < output_size ||
@@ -234,6 +592,10 @@ static int vdec_queue_setup(struct vb2_queue *q, unsigned int *num_buffers,
 		break;
 	case V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE:
 		switch (sess->pixfmt_cap) {
+		case V4L2_PIX_FMT_NV12:
+			sizes[0] = output_size + output_size / 2;
+			*num_planes = 1;
+			break;
 		case V4L2_PIX_FMT_NV12M:
 			sizes[0] = output_size;
 			sizes[1] = output_size / 2;
@@ -264,18 +626,30 @@ static void vdec_vb2_buf_queue(struct vb2_buffer *vb)
 	struct vb2_v4l2_buffer *vbuf = to_vb2_v4l2_buffer(vb);
 	struct amvdec_session *sess = vb2_get_drv_priv(vb->vb2_queue);
 	struct v4l2_m2m_ctx *m2m_ctx = sess->m2m_ctx;
+	struct amvdec_codec_ops *codec_ops = sess->fmt_out->codec_ops;
+	bool held = false;
 
-	v4l2_m2m_buf_queue(m2m_ctx, vbuf);
+	if (vb->type == V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE &&
+	    codec_ops->hold_capture_buf)
+		held = codec_ops->hold_capture_buf(sess, vbuf);
+	if (!held)
+		v4l2_m2m_buf_queue(m2m_ctx, vbuf);
+	if (vb->type == V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE && !held &&
+	    codec_ops->capture_queued)
+		codec_ops->capture_queued(sess);
 
 	if (!sess->streamon_out)
 		return;
+	if ((vb->type == V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE ||
+	     (vb->type == V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE && !held)) &&
+	    atomic_read(&sess->m2m_job_running) == AMVDEC_M2M_JOB_RUNNING)
+		schedule_work(&sess->esparser_queue_work);
 
 	if (sess->streamon_cap &&
 	    vb->type == V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE &&
 	    vdec_codec_needs_recycle(sess))
 		vdec_queue_recycle(sess, vb);
 
-	schedule_work(&sess->esparser_queue_work);
 }
 
 static int vdec_start_streaming(struct vb2_queue *q, unsigned int count)
@@ -284,10 +658,12 @@ static int vdec_start_streaming(struct vb2_queue *q, unsigned int count)
 	struct amvdec_codec_ops *codec_ops = sess->fmt_out->codec_ops;
 	struct amvdec_core *core = sess->core;
 	struct vb2_v4l2_buffer *buf;
+	int irq = vdec_session_irq(sess);
 	int ret;
 
-	if (core->cur_sess && core->cur_sess != sess) {
-		ret = -EBUSY;
+	mutex_lock(&core->hw_lock);
+	if (irq < 0) {
+		ret = irq;
 		goto bufs_done;
 	}
 
@@ -297,20 +673,37 @@ static int vdec_start_streaming(struct vb2_queue *q, unsigned int count)
 		sess->streamon_cap = 1;
 
 	if (!sess->streamon_out)
-		return 0;
+		goto unlock_ok;
 
 	if (sess->status == STATUS_NEEDS_RESUME &&
 	    q->type == V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE &&
 	    sess->changed_format) {
-		codec_ops->resume(sess);
+		v4l2_m2m_clear_state(sess->m2m_ctx);
+		ret = codec_ops->resume(sess);
+		if (ret)
+			goto bufs_done;
+		/* STREAMOFF/STREAMON starts a new capture sequence. */
+		sess->sequence_cap = 0;
 		sess->status = STATUS_RUNNING;
-		return 0;
+		WRITE_ONCE(sess->source_change_pending, false);
+		goto unlock_ok;
 	}
 
 	if (sess->status == STATUS_RUNNING ||
 	    sess->status == STATUS_NEEDS_RESUME ||
 	    sess->status == STATUS_INIT)
-		return 0;
+		goto unlock_ok;
+
+	if (codec_ops->context_switching) {
+		if (core->exclusive_sess) {
+			ret = -EBUSY;
+			goto bufs_done;
+		}
+	} else if (core->exclusive_sess ||
+		   core->context_switching_sessions) {
+		ret = -EBUSY;
+		goto bufs_done;
+	}
 
 	sess->vififo_size = SIZE_VIFIFO;
 	sess->vififo_vaddr =
@@ -321,6 +714,7 @@ static int vdec_start_streaming(struct vb2_queue *q, unsigned int count)
 		ret = -ENOMEM;
 		goto bufs_done;
 	}
+	sess->vififo_context_valid = false;
 
 	sess->should_stop = 0;
 	sess->keyframe_found = 0;
@@ -331,22 +725,40 @@ static int vdec_start_streaming(struct vb2_queue *q, unsigned int count)
 	atomic_set(&sess->esparser_queued_bufs, 0);
 	v4l2_ctrl_s_ctrl(sess->ctrl_min_buf_capture, 1);
 
-	ret = vdec_poweron(sess);
-	if (ret)
-		goto vififo_free;
-
 	sess->sequence_cap = 0;
 	sess->sequence_out = 0;
+	sess->status = STATUS_INIT;
+	if (!codec_ops->context_switching) {
+		struct amvdec_session **hw_slot;
+
+		hw_slot = &core->hw_sess[sess->fmt_out->vdec_ops->hw];
+		disable_irq(irq);
+		vdec_set_current_session(core, sess);
+
+		ret = vdec_poweron(sess);
+		if (ret) {
+			vdec_set_current_session(core, NULL);
+			enable_irq(irq);
+			sess->status = STATUS_STOPPED;
+			goto vififo_free;
+		}
+		*hw_slot = sess;
+		enable_irq(irq);
+	}
+
 	if (vdec_codec_needs_recycle(sess))
 		sess->recycle_thread = kthread_run(vdec_recycle_thread, sess,
 						   "vdec_recycle");
 
-	sess->status = STATUS_INIT;
-	core->cur_sess = sess;
-	schedule_work(&sess->esparser_queue_work);
-	return 0;
+	if (codec_ops->context_switching)
+		core->context_switching_sessions++;
+	else
+		core->exclusive_sess = sess;
+	goto unlock_ok;
 
 vififo_free:
+	kfree(sess->priv);
+	sess->priv = NULL;
 	dma_free_coherent(sess->core->dev, sess->vififo_size,
 			  sess->vififo_vaddr, sess->vififo_paddr);
 bufs_done:
@@ -360,17 +772,12 @@ bufs_done:
 	else
 		sess->streamon_cap = 0;
 
+	mutex_unlock(&core->hw_lock);
 	return ret;
-}
 
-static void vdec_free_canvas(struct amvdec_session *sess)
-{
-	int i;
-
-	for (i = 0; i < sess->canvas_num; ++i)
-		meson_canvas_free(sess->core->canvas, sess->canvas_alloc[i]);
-
-	sess->canvas_num = 0;
+unlock_ok:
+	mutex_unlock(&core->hw_lock);
+	return 0;
 }
 
 static void vdec_reset_timestamps(struct amvdec_session *sess)
@@ -399,23 +806,67 @@ static void vdec_stop_streaming(struct vb2_queue *q)
 	struct amvdec_codec_ops *codec_ops = sess->fmt_out->codec_ops;
 	struct amvdec_core *core = sess->core;
 	struct vb2_v4l2_buffer *buf;
+	struct amvdec_session **hw_slot;
+	bool decoder_active;
+	bool irq_disabled;
+	int irq = vdec_session_irq(sess);
 
-	if (sess->status == STATUS_RUNNING ||
-	    sess->status == STATUS_INIT ||
-	    (sess->status == STATUS_NEEDS_RESUME &&
-	     (!sess->streamon_out || !sess->streamon_cap))) {
+	hw_slot = &core->hw_sess[sess->fmt_out->vdec_ops->hw];
+
+	decoder_active = sess->status == STATUS_RUNNING ||
+			 sess->status == STATUS_INIT ||
+			 (sess->status == STATUS_NEEDS_RESUME &&
+			  (!sess->streamon_out || !sess->streamon_cap));
+	/* A shared IRQ is synchronized only when this session currently owns it. */
+	irq_disabled = decoder_active &&
+		(!codec_ops->context_switching ||
+		 amvdec_session_is_current(sess));
+	if (irq_disabled)
+		disable_irq(irq);
+
+lock_hardware:
+	mutex_lock(&core->hw_lock);
+	/*
+	 * Ownership may have changed between the lockless check and hw_lock.
+	 * Never wait for the threaded handler while holding hw_lock: it can yield
+	 * through vdec_m2m_release_hardware() and needs this mutex itself.
+	 */
+	if (decoder_active && !irq_disabled &&
+	    amvdec_session_is_current(sess)) {
+		mutex_unlock(&core->hw_lock);
+		disable_irq(irq);
+		irq_disabled = true;
+		goto lock_hardware;
+	}
+
+	if (decoder_active) {
 		if (vdec_codec_needs_recycle(sess))
 			kthread_stop(sess->recycle_thread);
 
-		vdec_poweroff(sess);
-		vdec_free_canvas(sess);
+		if (*hw_slot == sess) {
+			if (amvdec_session_is_current(sess)) {
+				vdec_set_current_session(core, NULL);
+				vdec_poweroff(sess);
+			} else {
+				vdec_poweroff_suspended(sess);
+			}
+			*hw_slot = NULL;
+		} else if (codec_ops->release && sess->priv) {
+			codec_ops->release(sess);
+		}
+
+		if (codec_ops->context_switching)
+			core->context_switching_sessions--;
+		else
+			core->exclusive_sess = NULL;
+
+		amvdec_free_canvases(sess);
 		dma_free_coherent(sess->core->dev, sess->vififo_size,
 				  sess->vififo_vaddr, sess->vififo_paddr);
 		vdec_reset_timestamps(sess);
 		vdec_reset_bufs_recycle(sess);
 		kfree(sess->priv);
 		sess->priv = NULL;
-		core->cur_sess = NULL;
 		sess->status = STATUS_STOPPED;
 	}
 
@@ -432,8 +883,13 @@ static void vdec_stop_streaming(struct vb2_queue *q)
 		while ((buf = v4l2_m2m_dst_buf_remove(sess->m2m_ctx)))
 			v4l2_m2m_buf_done(buf, VB2_BUF_STATE_ERROR);
 
+		amvdec_free_canvases(sess);
 		sess->streamon_cap = 0;
 	}
+
+	mutex_unlock(&core->hw_lock);
+	if (irq_disabled)
+		enable_irq(irq);
 }
 
 static int vdec_vb2_buf_prepare(struct vb2_buffer *vb)
@@ -504,8 +960,8 @@ vdec_try_fmt_common(struct amvdec_session *sess, u32 size,
 	case V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE:
 		fmt_out = find_format(fmts, size, pixmp->pixelformat);
 		if (!fmt_out) {
-			pixmp->pixelformat = V4L2_PIX_FMT_MPEG2;
-			fmt_out = find_format(fmts, size, pixmp->pixelformat);
+			pixmp->pixelformat = fmts[0].pixfmt;
+			fmt_out = &fmts[0];
 		}
 		break;
 	case V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE:
@@ -517,7 +973,8 @@ vdec_try_fmt_common(struct amvdec_session *sess, u32 size,
 
 	pixmp->width  = clamp(pixmp->width,  (u32)256, fmt_out->max_width);
 	pixmp->height = clamp(pixmp->height, (u32)144, fmt_out->max_height);
-	output_size = get_output_size(pixmp->width, pixmp->height);
+	output_size = get_output_size(fmt_out->codec_ops,
+				      pixmp->width, pixmp->height);
 
 	if (f->type == V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE) {
 		if (!pfmt[0].sizeimage)
@@ -530,7 +987,11 @@ vdec_try_fmt_common(struct amvdec_session *sess, u32 size,
 			pixmp->pixelformat = fmt_out->pixfmts_cap[0];
 
 		memset(pfmt[1].reserved, 0, sizeof(pfmt[1].reserved));
-		if (pixmp->pixelformat == V4L2_PIX_FMT_NV12M) {
+		if (pixmp->pixelformat == V4L2_PIX_FMT_NV12) {
+			pfmt[0].sizeimage = output_size + output_size / 2;
+			pfmt[0].bytesperline = ALIGN(pixmp->width, 32);
+			pixmp->num_planes = 1;
+		} else if (pixmp->pixelformat == V4L2_PIX_FMT_NV12M) {
 			pfmt[0].sizeimage = output_size;
 			pfmt[0].bytesperline = ALIGN(pixmp->width, 32);
 
@@ -723,6 +1184,7 @@ vdec_decoder_cmd(struct file *file, void *fh, struct v4l2_decoder_cmd *cmd)
 	if (cmd->cmd == V4L2_DEC_CMD_START) {
 		v4l2_m2m_clear_state(sess->m2m_ctx);
 		sess->should_stop = 0;
+		sess->draining = false;
 		return 0;
 	}
 
@@ -731,6 +1193,17 @@ vdec_decoder_cmd(struct file *file, void *fh, struct v4l2_decoder_cmd *cmd)
 		return -EINVAL;
 
 	dev_dbg(dev, "Received V4L2_DEC_CMD_STOP\n");
+
+	if (codec_ops->context_switching &&
+	    (v4l2_m2m_num_src_bufs_ready(sess->m2m_ctx) ||
+	     atomic_read(&sess->esparser_queued_bufs) ||
+	     (codec_ops->async_drain &&
+	      atomic_read(&sess->m2m_job_running) != AMVDEC_M2M_JOB_IDLE))) {
+		WRITE_ONCE(sess->draining, 1);
+		if (!vdec_m2m_finish_drain(sess))
+			v4l2_m2m_try_schedule(sess->m2m_ctx);
+		return 0;
+	}
 
 	sess->should_stop = 1;
 
@@ -873,23 +1346,20 @@ static int vdec_open(struct file *file)
 
 	sess->core = core;
 
-	sess->m2m_dev = v4l2_m2m_init(&vdec_m2m_ops);
-	if (IS_ERR(sess->m2m_dev)) {
-		dev_err(dev, "Fail to v4l2_m2m_init\n");
-		ret = PTR_ERR(sess->m2m_dev);
-		goto err_free_sess;
-	}
-
-	sess->m2m_ctx = v4l2_m2m_ctx_init(sess->m2m_dev, sess, m2m_queue_init);
+	sess->m2m_ctx = v4l2_m2m_ctx_init(core->m2m_dev, sess, m2m_queue_init);
 	if (IS_ERR(sess->m2m_ctx)) {
 		dev_err(dev, "Fail to v4l2_m2m_ctx_init\n");
 		ret = PTR_ERR(sess->m2m_ctx);
-		goto err_m2m_release;
+		goto err_free_sess;
 	}
+	sess->m2m_ctx->ignore_cap_streaming = true;
+	sess->m2m_ctx->cap_q_ctx.buffered = true;
+	/* job_ready gates input and permits codec-internal resume jobs. */
+	sess->m2m_ctx->out_q_ctx.buffered = true;
 
 	ret = vdec_init_ctrls(sess);
 	if (ret)
-		goto err_m2m_release;
+		goto err_m2m_ctx_release;
 
 	sess->pixfmt_cap = formats[0].pixfmts_cap[0];
 	sess->fmt_out = &formats[0];
@@ -902,6 +1372,7 @@ static int vdec_open(struct file *file)
 	INIT_LIST_HEAD(&sess->timestamps);
 	INIT_LIST_HEAD(&sess->bufs_recycle);
 	INIT_WORK(&sess->esparser_queue_work, esparser_queue_all_src);
+	atomic_set(&sess->m2m_job_running, AMVDEC_M2M_JOB_IDLE);
 	mutex_init(&sess->lock);
 	mutex_init(&sess->bufs_recycle_lock);
 	spin_lock_init(&sess->ts_spinlock);
@@ -913,8 +1384,8 @@ static int vdec_open(struct file *file)
 
 	return 0;
 
-err_m2m_release:
-	v4l2_m2m_release(sess->m2m_dev);
+err_m2m_ctx_release:
+	v4l2_m2m_ctx_release(sess->m2m_ctx);
 err_free_sess:
 	kfree(sess);
 	return ret;
@@ -924,8 +1395,10 @@ static int vdec_close(struct file *file)
 {
 	struct amvdec_session *sess = file_to_amvdec_session(file);
 
+	mutex_lock(&sess->lock);
 	v4l2_m2m_ctx_release(sess->m2m_ctx);
-	v4l2_m2m_release(sess->m2m_dev);
+	mutex_unlock(&sess->lock);
+	cancel_work_sync(&sess->esparser_queue_work);
 	v4l2_fh_del(&sess->fh, file);
 	v4l2_fh_exit(&sess->fh);
 
@@ -949,9 +1422,16 @@ static const struct v4l2_file_operations vdec_fops = {
 static irqreturn_t vdec_isr(int irq, void *data)
 {
 	struct amvdec_core *core = data;
-	struct amvdec_session *sess = core->cur_sess;
+	struct amvdec_session *sess;
 
-	sess->last_irq_jiffies = get_jiffies_64();
+	sess = vdec_current_session(core, irq);
+	if (sess) {
+		sess->last_irq_jiffies = get_jiffies_64();
+		WRITE_ONCE(sess->irq_seen, true);
+	}
+
+	if (!sess)
+		return IRQ_NONE;
 
 	return sess->fmt_out->codec_ops->isr(sess);
 }
@@ -959,7 +1439,12 @@ static irqreturn_t vdec_isr(int irq, void *data)
 static irqreturn_t vdec_threaded_isr(int irq, void *data)
 {
 	struct amvdec_core *core = data;
-	struct amvdec_session *sess = core->cur_sess;
+	struct amvdec_session *sess;
+
+	sess = vdec_current_session(core, irq);
+
+	if (!sess)
+		return IRQ_NONE;
 
 	return sess->fmt_out->codec_ops->threaded_isr(sess);
 }
@@ -973,6 +1458,8 @@ static const struct of_device_id vdec_dt_match[] = {
 	  .data = &vdec_platform_gxl },
 	{ .compatible = "amlogic,gxlx-vdec",
 	  .data = &vdec_platform_gxlx },
+	{ .compatible = "amlogic,g12b-vdec",
+	  .data = &vdec_platform_g12b },
 	{ .compatible = "amlogic,g12a-vdec",
 	  .data = &vdec_platform_g12a },
 	{ .compatible = "amlogic,sm1-vdec",
@@ -995,6 +1482,10 @@ static int vdec_probe(struct platform_device *pdev)
 		return -ENOMEM;
 
 	core->dev = dev;
+	mutex_init(&core->lock);
+	mutex_init(&core->hw_lock);
+	mutex_init(&core->parser_lock);
+	spin_lock_init(&core->irq_lock);
 	platform_set_drvdata(pdev, core);
 
 	core->dos_base = devm_platform_ioremap_resource_byname(pdev, "dos");
@@ -1020,8 +1511,7 @@ static int vdec_probe(struct platform_device *pdev)
 	of_id = of_match_node(vdec_dt_match, dev->of_node);
 	core->platform = of_id->data;
 
-	if (core->platform->revision == VDEC_REVISION_G12A ||
-	    core->platform->revision == VDEC_REVISION_SM1) {
+	if (core->platform->revision >= VDEC_REVISION_G12A) {
 		core->vdec_hevcf_clk = devm_clk_get(dev, "vdec_hevcf");
 		if (IS_ERR(core->vdec_hevcf_clk))
 			return -EPROBE_DEFER;
@@ -1043,15 +1533,38 @@ static int vdec_probe(struct platform_device *pdev)
 	if (IS_ERR(core->vdec_hevc_clk))
 		return -EPROBE_DEFER;
 
-	irq = platform_get_irq_byname(pdev, "vdec");
+	irq = platform_get_irq_byname_optional(pdev, "mbox1");
+	if (irq == -ENXIO)
+		irq = platform_get_irq_byname(pdev, "vdec");
 	if (irq < 0)
 		return irq;
+	core->irqs[AMVDEC_IRQ_MBOX1] = irq;
 
 	ret = devm_request_threaded_irq(core->dev, irq, vdec_isr,
 					vdec_threaded_isr, IRQF_ONESHOT,
-					"vdec", core);
+					"vdec-mbox1", core);
 	if (ret)
 		return ret;
+
+	irq = platform_get_irq_byname_optional(pdev, "mbox0");
+	if (irq == -EPROBE_DEFER)
+		return irq;
+	if (irq == -ENXIO) {
+		/* Multi-instance HEVC firmware signals the dedicated mailbox 0. */
+		core->irqs[AMVDEC_IRQ_MBOX0] = irq;
+		dev_warn(dev, "HEVC mailbox IRQ is unavailable\n");
+	} else {
+		if (irq < 0)
+			return irq;
+
+		core->irqs[AMVDEC_IRQ_MBOX0] = irq;
+		ret = devm_request_threaded_irq(core->dev, irq, vdec_isr,
+						vdec_threaded_isr,
+						IRQF_ONESHOT,
+						"vdec-mbox0", core);
+		if (ret)
+			return ret;
+	}
 
 	ret = esparser_init(pdev, core);
 	if (ret)
@@ -1063,15 +1576,21 @@ static int vdec_probe(struct platform_device *pdev)
 		return -ENOMEM;
 	}
 
+	core->m2m_dev = v4l2_m2m_init(&vdec_m2m_ops);
+	if (IS_ERR(core->m2m_dev)) {
+		ret = PTR_ERR(core->m2m_dev);
+		dev_err(dev, "Failed to initialize the m2m scheduler\n");
+		goto err_v4l2_unregister;
+	}
+
 	vdev = video_device_alloc();
 	if (!vdev) {
 		ret = -ENOMEM;
-		goto err_vdev_release;
+		goto err_m2m_release;
 	}
 
 	core->vdev_dec = vdev;
 	core->dev_dec = dev;
-	mutex_init(&core->lock);
 
 	strscpy(vdev->name, "meson-video-decoder", sizeof(vdev->name));
 	vdev->release = video_device_release;
@@ -1094,6 +1613,9 @@ static int vdec_probe(struct platform_device *pdev)
 
 err_vdev_release:
 	video_device_release(vdev);
+err_m2m_release:
+	v4l2_m2m_release(core->m2m_dev);
+err_v4l2_unregister:
 	v4l2_device_unregister(&core->v4l2_dev);
 	return ret;
 }
@@ -1103,6 +1625,7 @@ static void vdec_remove(struct platform_device *pdev)
 	struct amvdec_core *core = platform_get_drvdata(pdev);
 
 	video_unregister_device(core->vdev_dec);
+	v4l2_m2m_release(core->m2m_dev);
 	v4l2_device_unregister(&core->v4l2_dev);
 }
 

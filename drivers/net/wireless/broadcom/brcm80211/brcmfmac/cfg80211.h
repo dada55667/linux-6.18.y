@@ -493,6 +493,6 @@ void brcmf_cfg80211_free_netdev(struct net_device *ndev);
 
 int brcmf_set_wsec(struct brcmf_if *ifp, const u8 *key, u16 key_len, u16 flags);
 int brcmf_cfg80211_mgmt_tx(struct wiphy *wiphy, struct wireless_dev *wdev,
-			   struct cfg80211_mgmt_tx_params *params, u64 *cookie);
+			   struct cfg80211_mgmt_tx_params *params, u64 cookie);
 
 #endif /* BRCMFMAC_CFG80211_H */

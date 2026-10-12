@@ -176,9 +176,9 @@ static unsigned int fq_codel_drop(struct Qdisc *sch, unsigned int max_packets,
 	WRITE_ONCE(flow->cvars.count, flow->cvars.count + i);
 	WRITE_ONCE(q->backlogs[idx], q->backlogs[idx] - len);
 	q->memory_usage -= mem;
-	sch->qstats.drops += i;
-	sch->qstats.backlog -= len;
-	sch->q.qlen -= i;
+	__qdisc_qstats_drop(sch, i);
+	qstats_backlog_sub(sch, len);
+	WRITE_ONCE(sch->q.qlen, sch->q.qlen - i);
 	return idx;
 }
 
@@ -215,7 +215,8 @@ static int fq_codel_enqueue(struct sk_buff *skb, struct Qdisc *sch,
 	get_codel_cb(skb)->mem_usage = skb->truesize;
 	q->memory_usage += get_codel_cb(skb)->mem_usage;
 	memory_limited = q->memory_usage > q->memory_limit;
-	if (++sch->q.qlen <= sch->limit && !memory_limited)
+	qdisc_qlen_inc(sch);
+	if (sch->q.qlen <= sch->limit && !memory_limited)
 		return NET_XMIT_SUCCESS;
 
 	prev_backlog = sch->qstats.backlog;
@@ -266,8 +267,8 @@ static struct sk_buff *dequeue_func(struct codel_vars *vars, void *ctx)
 		WRITE_ONCE(q->backlogs[flow - q->flows],
 			   q->backlogs[flow - q->flows] - qdisc_pkt_len(skb));
 		q->memory_usage -= get_codel_cb(skb)->mem_usage;
-		sch->q.qlen--;
-		sch->qstats.backlog -= qdisc_pkt_len(skb);
+		qdisc_qlen_dec(sch);
+		qdisc_qstats_backlog_dec(sch, skb);
 	}
 	return skb;
 }
@@ -508,6 +509,7 @@ static int fq_codel_init(struct Qdisc *sch, struct nlattr *opt,
 			 struct netlink_ext_ack *extack)
 {
 	struct fq_codel_sched_data *q = qdisc_priv(sch);
+	u32 mtu;
 	int i;
 	int err;
 
@@ -519,13 +521,14 @@ static int fq_codel_init(struct Qdisc *sch, struct nlattr *opt,
 	q->memory_limit = 4 << 20; /* 4 MBytes */
 #endif
 	q->drop_batch_size = 64;
-	q->quantum = psched_mtu(qdisc_dev(sch));
+	mtu = min_t(u32, psched_mtu(qdisc_dev(sch)), FQ_CODEL_QUANTUM_MAX);
+	q->quantum = clamp_t(u32, mtu, 256, FQ_CODEL_QUANTUM_MAX);
 	INIT_LIST_HEAD(&q->new_flows);
 	INIT_LIST_HEAD(&q->old_flows);
 	codel_params_init(&q->cparams);
 	codel_stats_init(&q->cstats);
 	q->cparams.ecn = true;
-	q->cparams.mtu = psched_mtu(qdisc_dev(sch));
+	q->cparams.mtu = mtu;
 
 	if (opt) {
 		err = fq_codel_change(sch, opt, extack);

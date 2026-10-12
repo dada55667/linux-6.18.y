@@ -7,6 +7,8 @@
 #ifndef __MESON_VDEC_HEVC_COMMON_H_
 #define __MESON_VDEC_HEVC_COMMON_H_
 
+#include <linux/scatterlist.h>
+
 #include "vdec.h"
 
 #define PARSER_CMD_SKIP_CFG_0 0x0000090b
@@ -21,12 +23,17 @@ extern const u16 vdec_hevc_parser_cmd[VDEC_HEVC_PARSER_CMD_LEN];
 struct codec_hevc_common {
 	void      *fbc_buffer_vaddr[MAX_REF_PIC_NUM];
 	dma_addr_t fbc_buffer_paddr[MAX_REF_PIC_NUM];
+	struct sg_table *mmu_body_sgt[MAX_REF_PIC_NUM];
+	size_t fbc_buffer_size;
 
 	void      *mmu_header_vaddr[MAX_REF_PIC_NUM];
 	dma_addr_t mmu_header_paddr[MAX_REF_PIC_NUM];
 
 	void      *mmu_map_vaddr;
 	dma_addr_t mmu_map_paddr;
+
+	dma_addr_t ref_buffer_paddr[MAX_REF_PIC_NUM][2];
+	u32 ref_buffer_count;
 };
 
 /* Returns 1 if we must use framebuffer compression */
@@ -62,9 +69,13 @@ int codec_hevc_setup_buffers(struct amvdec_session *sess,
 			     struct codec_hevc_common *comm,
 			     int is_10bit);
 
-void codec_hevc_fill_mmu_map(struct amvdec_session *sess,
-			     struct codec_hevc_common *comm,
-			     struct vb2_buffer *vb,
-			     u32 is_10bit);
+void codec_hevc_restore_buffers(struct amvdec_session *sess,
+				struct codec_hevc_common *comm,
+				int is_10bit);
+
+int codec_hevc_fill_mmu_map(struct amvdec_session *sess,
+			    struct codec_hevc_common *comm,
+			    struct vb2_buffer *vb,
+			    u32 is_10bit);
 
 #endif

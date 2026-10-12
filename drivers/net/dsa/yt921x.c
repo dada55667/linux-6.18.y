@@ -4798,6 +4798,64 @@ static int yt921x_chip_setup(struct yt921x_priv *priv)
 	return 0;
 }
 
+/* bdy-g98 ties both RJ45 LEDs of each gigabit jack to one electrical
+ * net driven by the port's two parallel LED pins, so the two LEDs
+ * always show the same thing: a pin driving the net low wins over a
+ * released pin, and blink wins over solid.  The board profile is
+ * therefore a joint one: LED1 holds the net lit on link at any speed
+ * and blinks it on RX/TX activity, LED0 keeps the net low while the
+ * port is trying to link.  Net effect: both LEDs solid on link, both
+ * blink on traffic, both dark while unlinked.  YT921X_RST_HW reverts
+ * the LED controller, so apply this after reset.
+ */
+#define YT921X_LED_PROFILE_LINK	(YT921X_LED_10M_ON | YT921X_LED_100M_ON | \
+				 YT921X_LED_1000M_ON | \
+				 YT921X_LED_DISABLE_LINK_TRY)
+#define YT921X_LED_PROFILE_ACT	(YT921X_LED_10M_ON | YT921X_LED_100M_ON | \
+				 YT921X_LED_1000M_ON | \
+				 YT921X_LED_RXACT_BLINK | \
+				 YT921X_LED_TXACT_BLINK | YT921X_LED_ACT_BLINK_IND)
+
+/* Caller must hold priv->reg_lock */
+static int yt921x_led_profile_setup(struct yt921x_priv *priv)
+{
+	struct device *dev = to_device(priv);
+	struct dsa_switch *ds = &priv->ds;
+	struct dsa_port *dp;
+	u32 old0, old1;
+	int res;
+
+	if (!of_property_read_bool(dev->of_node,
+				   "motorcomm,bdy-g98-led-profile"))
+		return 0;
+
+	dsa_switch_for_each_user_port(dp, ds) {
+		res = yt921x_reg_read(priv, YT921X_LED_CTRL_0(dp->index),
+				      &old0);
+		if (res)
+			return res;
+		res = yt921x_reg_read(priv, YT921X_LED_CTRL_1(dp->index),
+				      &old1);
+		if (res)
+			return res;
+		res = yt921x_reg_write(priv, YT921X_LED_CTRL_0(dp->index),
+				       YT921X_LED_PROFILE_LINK);
+		if (res)
+			return res;
+		res = yt921x_reg_write(priv, YT921X_LED_CTRL_1(dp->index),
+				       YT921X_LED_PROFILE_ACT);
+		if (res)
+			return res;
+
+		dev_info(dev,
+			 "port %d: LED0 0x%08x -> 0x%08lx, LED1 0x%08x -> 0x%08lx\n",
+			 dp->index, old0, YT921X_LED_PROFILE_LINK, old1,
+			 YT921X_LED_PROFILE_ACT);
+	}
+
+	return 0;
+}
+
 static int yt921x_dsa_setup(struct dsa_switch *ds)
 {
 	struct yt921x_priv *priv = to_yt921x_priv(ds);
@@ -4839,12 +4897,11 @@ static int yt921x_dsa_setup(struct dsa_switch *ds)
 
 	mutex_lock(&priv->reg_lock);
 	res = yt921x_chip_setup(priv);
+	if (!res)
+		res = yt921x_led_profile_setup(priv);
 	mutex_unlock(&priv->reg_lock);
 
-	if (res)
-		return res;
-
-	return 0;
+	return res;
 }
 
 static const struct phylink_mac_ops yt921x_phylink_mac_ops = {

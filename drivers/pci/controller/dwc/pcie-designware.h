@@ -449,11 +449,12 @@ struct dw_pcie_rp {
 	bool			ecam_enabled;
 	bool			native_ecam;
 	bool                    skip_l23_ready;
+	bool			skip_pwrctrl_off;
 };
 
 struct dw_pcie_ep_ops {
-	void	(*pre_init)(struct dw_pcie_ep *ep);
-	void	(*init)(struct dw_pcie_ep *ep);
+	int	(*pre_init)(struct dw_pcie_ep *ep);
+	int	(*init)(struct dw_pcie_ep *ep);
 	int	(*raise_irq)(struct dw_pcie_ep *ep, u8 func_no,
 			     unsigned int type, u16 interrupt_num);
 	const struct pci_epc_features* (*get_features)(struct dw_pcie_ep *ep);
@@ -496,6 +497,7 @@ struct dw_pcie_ep {
 
 	/* MSI outbound iATU state */
 	bool			msi_iatu_mapped;
+	size_t			msi_iatu_mapped_offset;
 	u64			msi_msg_addr;
 	size_t			msi_map_size;
 };
@@ -604,6 +606,7 @@ int dw_pcie_prog_ep_inbound_atu(struct dw_pcie *pci, u8 func_no, int index,
 				u8 bar, size_t size);
 void dw_pcie_disable_atu(struct dw_pcie *pci, u32 dir, int index);
 void dw_pcie_hide_unsupported_l1ss(struct dw_pcie *pci);
+void dw_pcie_program_t_power_on(struct dw_pcie *pci, u32 t_power_on);
 void dw_pcie_setup(struct dw_pcie *pci);
 void dw_pcie_iatu_detect(struct dw_pcie *pci);
 int dw_pcie_edma_detect(struct dw_pcie *pci);

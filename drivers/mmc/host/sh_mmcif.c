@@ -1462,6 +1462,7 @@ static int sh_mmcif_probe(struct platform_device *pdev)
 	host->pd = pdev;
 
 	spin_lock_init(&host->lock);
+	mutex_init(&host->thread_lock);
 
 	mmc->ops = &sh_mmcif_ops;
 	sh_mmcif_init_ocr(host);
@@ -1506,21 +1507,15 @@ static int sh_mmcif_probe(struct platform_device *pdev)
 	name = irq[1] < 0 ? dev_name(dev) : "sh_mmc:error";
 	ret = devm_request_threaded_irq(dev, irq[0], sh_mmcif_intr,
 					sh_mmcif_irqt, 0, name, host);
-	if (ret) {
-		dev_err(dev, "request_irq error (%s)\n", name);
+	if (ret)
 		goto err_clk;
-	}
 	if (irq[1] >= 0) {
 		ret = devm_request_threaded_irq(dev, irq[1],
 						sh_mmcif_intr, sh_mmcif_irqt,
 						0, "sh_mmc:int", host);
-		if (ret) {
-			dev_err(dev, "request_irq error (sh_mmc:int)\n");
+		if (ret)
 			goto err_clk;
-		}
 	}
-
-	mutex_init(&host->thread_lock);
 
 	ret = mmc_add_host(mmc);
 	if (ret < 0)

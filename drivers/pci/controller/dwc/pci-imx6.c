@@ -154,7 +154,6 @@ struct imx_pcie {
 	bool			enable_ext_refclk;
 	struct clk_bulk_data	*clks;
 	int			num_clks;
-	bool			enable_ext_refclk;
 	struct regmap		*iomuxc_gpr;
 	u16			msi_ctrl;
 	u32			controller_id;

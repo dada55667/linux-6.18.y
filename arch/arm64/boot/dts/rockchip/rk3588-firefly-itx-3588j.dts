@@ -19,6 +19,7 @@
 	aliases {
 		ethernet0 = &gmac0;
 		ethernet1 = &gmac1;
+		mmc1 = &sdmmc;
 	};
 
 	chosen {
@@ -108,7 +109,7 @@
 		#cooling-cells = <2>;
 		cooling-levels = <0 120 150 180 210 240 255>;
 		fan-supply = <&vcc12v_dcin>;
-		pwms = <&pwm15 0 50000 1>;
+		pwms = <&pwm15 0 50000 0>;
 	};
 
 	hdmi0-con {
@@ -322,6 +323,10 @@
 };
 
 &hdmi0 {
+	frl-enable-gpios = <&gpio4 RK_PA0 GPIO_ACTIVE_LOW>;
+	pinctrl-0 = <&hdmim0_tx0_cec &hdmim0_tx0_hpd
+		     &hdmim0_tx0_scl &hdmim0_tx0_sda &hdmi0_tx_on_h>;
+	pinctrl-names = "default";
 	status = "okay";
 };
 
@@ -451,6 +456,11 @@
 	rgmii_phy0: ethernet-phy@1 {
 		compatible = "ethernet-phy-ieee802.3-c22";
 		reg = <0x1>;
+		pinctrl-names = "default";
+		pinctrl-0 = <&gmac0_phy_rst>;
+		reset-assert-us = <20000>;
+		reset-deassert-us = <100000>;
+		reset-gpios = <&gpio3 RK_PC7 GPIO_ACTIVE_LOW>;
 	};
 };
 
@@ -458,6 +468,11 @@
 	rgmii_phy1: ethernet-phy@1 {
 		compatible = "ethernet-phy-ieee802.3-c22";
 		reg = <0x1>;
+		pinctrl-names = "default";
+		pinctrl-0 = <&gmac1_phy_rst>;
+		reset-assert-us = <20000>;
+		reset-deassert-us = <100000>;
+		reset-gpios = <&gpio3 RK_PB7 GPIO_ACTIVE_LOW>;
 	};
 };
 
@@ -484,6 +499,22 @@
 	dp {
 		dp1_hpd: dp1-hpd {
 			 rockchip,pins = <1 RK_PA4 RK_FUNC_GPIO &pcfg_pull_none>;
+		};
+	};
+
+	ethernet {
+		gmac0_phy_rst: gmac0-phy-rst {
+			rockchip,pins = <3 RK_PC7 RK_FUNC_GPIO &pcfg_pull_none>;
+		};
+
+		gmac1_phy_rst: gmac1-phy-rst {
+			rockchip,pins = <3 RK_PB7 RK_FUNC_GPIO &pcfg_pull_none>;
+		};
+	};
+
+	hdmi {
+		hdmi0_tx_on_h: hdmi0-tx-on-h {
+			rockchip,pins = <4 RK_PA0 RK_FUNC_GPIO &pcfg_pull_none>;
 		};
 	};
 
@@ -555,14 +586,37 @@
 	status = "okay";
 };
 
+&saradc {
+	vref-supply = <&vcc_1v8_s0>;
+	status = "okay";
+};
+
+&sdmmc {
+	bus-width = <4>;
+	cd-gpios = <&gpio0 RK_PA4 GPIO_ACTIVE_LOW>;
+	disable-wp;
+	no-mmc;
+	no-sdio;
+	sd-uhs-sdr104;
+	vmmc-supply = <&vcc_3v3_s3>;
+	vqmmc-supply = <&vccio_sd_s0>;
+	status = "okay";
+};
+
+&tsadc {
+	status = "okay";
+};
+
 /* uart/232/485 */
 &uart0 {
 	pinctrl-0 = <&uart0m2_xfer>;
+	pinctrl-names = "default";
 	status = "okay";
 };
 
 &uart1 {
 	pinctrl-0 = <&uart1m1_xfer>;
+	pinctrl-names = "default";
 	status = "okay";
 };
 

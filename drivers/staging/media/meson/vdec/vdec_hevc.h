@@ -10,4 +10,6 @@
 
 extern struct amvdec_ops vdec_hevc_ops;
 
+void vdec_hevc_quiesce(struct amvdec_session *sess);
+
 #endif

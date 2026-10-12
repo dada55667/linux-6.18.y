@@ -42,24 +42,35 @@ struct btmtksdio_data {
 	const char *fwname;
 	u16 chipid;
 	bool lp_mbox_supported;
+	bool pm_runtime_supported;
 };
 
 static const struct btmtksdio_data mt7663_data = {
 	.fwname = FIRMWARE_MT7663,
 	.chipid = 0x7663,
 	.lp_mbox_supported = false,
+	.pm_runtime_supported = true,
 };
 
 static const struct btmtksdio_data mt7668_data = {
 	.fwname = FIRMWARE_MT7668,
 	.chipid = 0x7668,
 	.lp_mbox_supported = false,
+	.pm_runtime_supported = true,
 };
 
 static const struct btmtksdio_data mt7921_data = {
 	.fwname = FIRMWARE_MT7961,
 	.chipid = 0x7921,
 	.lp_mbox_supported = true,
+	.pm_runtime_supported = true,
+};
+
+static const struct btmtksdio_data mt7902_data = {
+	.fwname = FIRMWARE_MT7902,
+	.chipid = 0x7902,
+	.lp_mbox_supported = false,
+	.pm_runtime_supported = false,
 };
 
 static const struct sdio_device_id btmtksdio_table[] = {
@@ -69,6 +80,8 @@ static const struct sdio_device_id btmtksdio_table[] = {
 	 .driver_data = (kernel_ulong_t)&mt7668_data },
 	{SDIO_DEVICE(SDIO_VENDOR_ID_MEDIATEK, SDIO_DEVICE_ID_MEDIATEK_MT7961),
 	 .driver_data = (kernel_ulong_t)&mt7921_data },
+	{SDIO_DEVICE(SDIO_VENDOR_ID_MEDIATEK, SDIO_DEVICE_ID_MEDIATEK_MT7902),
+	.driver_data = (kernel_ulong_t)&mt7902_data },
 	{ }	/* Terminating entry */
 };
 MODULE_DEVICE_TABLE(sdio, btmtksdio_table);
@@ -127,7 +140,10 @@ struct mtkbtsdio_hdr {
 	u8	bt_type;
 } __packed;
 
+struct mt7663_combo;
+
 struct btmtksdio_dev {
+	struct mt7663_combo *combo;
 	struct hci_dev *hdev;
 	struct sdio_func *func;
 	struct device *dev;
@@ -142,6 +158,8 @@ struct btmtksdio_dev {
 
 	struct gpio_desc *reset;
 };
+
+#include "btmtksdio-w103d.h"
 
 static int mtk_hci_wmt_sync(struct hci_dev *hdev,
 			    struct btmtk_hci_wmt_params *wmt_params)
@@ -259,12 +277,24 @@ static int btmtksdio_tx_packet(struct btmtksdio_dev *bdev,
 			       struct sk_buff *skb)
 {
 	struct mtkbtsdio_hdr *sdio_hdr;
+	unsigned int len, pad_len;
 	int err;
 
-	/* Make sure that there are enough rooms for SDIO header */
-	if (unlikely(skb_headroom(skb) < sizeof(*sdio_hdr))) {
-		err = pskb_expand_head(skb, sizeof(*sdio_hdr), 0,
-				       GFP_ATOMIC);
+	/* Make sure that the data buffer is not shared with anyone else and
+	 * that there is enough room for the SDIO header
+	 */
+	err = skb_cow_head(skb, sizeof(*sdio_hdr));
+	if (err < 0)
+		return err;
+
+	/* The transfer is rounded up to the SDIO block size, so the buffer
+	 * has to provide tailroom for the padding as well
+	 */
+	len = skb->len + sizeof(*sdio_hdr);
+	pad_len = round_up(len, MTK_SDIO_BLOCK_SIZE) - len;
+
+	if (unlikely(skb_tailroom(skb) < pad_len)) {
+		err = pskb_expand_head(skb, 0, pad_len, GFP_ATOMIC);
 		if (err < 0)
 			return err;
 	}
@@ -277,19 +307,22 @@ static int btmtksdio_tx_packet(struct btmtksdio_dev *bdev,
 	sdio_hdr->reserved = cpu_to_le16(0);
 	sdio_hdr->bt_type = hci_skb_pkt_type(skb);
 
-	clear_bit(BTMTKSDIO_HW_TX_READY, &bdev->tx_state);
-	err = sdio_writesb(bdev->func, MTK_REG_CTDR, skb->data,
-			   round_up(skb->len, MTK_SDIO_BLOCK_SIZE));
-	if (err < 0)
-		goto err_skb_pull;
+	/* Zero the padding so that no uninitialised memory is sent out */
+	skb_put_zero(skb, pad_len);
 
-	bdev->hdev->stat.byte_tx += skb->len;
+	clear_bit(BTMTKSDIO_HW_TX_READY, &bdev->tx_state);
+	err = sdio_writesb(bdev->func, MTK_REG_CTDR, skb->data, skb->len);
+	if (err < 0)
+		goto err_skb_restore;
+
+	bdev->hdev->stat.byte_tx += len;
 
 	kfree_skb(skb);
 
 	return 0;
 
-err_skb_pull:
+err_skb_restore:
+	skb_trim(skb, len);
 	skb_pull(skb, sizeof(*sdio_hdr));
 
 	return err;
@@ -476,7 +509,8 @@ static int btmtksdio_rx_packet(struct btmtksdio_dev *bdev, u16 rx_size)
 	err = -EILSEQ;
 
 	if (rx_size != le16_to_cpu(sdio_hdr->len)) {
-		bt_dev_err(bdev->hdev, "Rx size in sdio header is mismatched ");
+		bt_dev_err_ratelimited(bdev->hdev,
+				       "Rx size in sdio header is mismatched ");
 		goto err_kfree_skb;
 	}
 
@@ -495,14 +529,19 @@ static int btmtksdio_rx_packet(struct btmtksdio_dev *bdev, u16 rx_size)
 	}
 
 	if (i >= pkts_count) {
-		bt_dev_err(bdev->hdev, "Invalid bt type 0x%02x",
-			   sdio_hdr->bt_type);
+		/* Rate limited: a malfunctioning chip can feed a continuous
+		 * stream of garbage packets, and the unthrottled printk
+		 * flood is enough to wedge a serial console.
+		 */
+		bt_dev_err_ratelimited(bdev->hdev, "Invalid bt type 0x%02x",
+				       sdio_hdr->bt_type);
 		goto err_kfree_skb;
 	}
 
 	/* Remaining bytes cannot hold a header*/
 	if (skb->len < (&pkts[i])->hlen) {
-		bt_dev_err(bdev->hdev, "The size of bt header is mismatched");
+		bt_dev_err_ratelimited(bdev->hdev,
+				       "The size of bt header is mismatched");
 		goto err_kfree_skb;
 	}
 
@@ -522,7 +561,8 @@ static int btmtksdio_rx_packet(struct btmtksdio_dev *bdev, u16 rx_size)
 
 	/* Remaining bytes cannot hold a payload */
 	if (pad_size < 0) {
-		bt_dev_err(bdev->hdev, "The size of bt payload is mismatched");
+		bt_dev_err_ratelimited(bdev->hdev,
+				       "The size of bt payload is mismatched");
 		goto err_kfree_skb;
 	}
 
@@ -640,6 +680,17 @@ static int btmtksdio_open(struct hci_dev *hdev)
 	u32 val;
 	int err;
 
+	/* On the MT7668 the close path is a pure software state change
+	 * (see btmtksdio_close), so a re-open finds the function still
+	 * running exactly as the first open left it. Re-writing the SDIO
+	 * plumbing here is what throws the chip into the unrecoverable
+	 * state observed on device (function query reporting off, garbage
+	 * packet floods), so skip it entirely.
+	 */
+	if (bdev->data->chipid == 0x7668 &&
+	    test_bit(BTMTKSDIO_FUNC_ENABLED, &bdev->tx_state))
+		return 0;
+
 	sdio_claim_host(bdev->func);
 
 	err = sdio_enable_func(bdev->func);
@@ -710,7 +761,15 @@ err_release_irq:
 	sdio_release_irq(bdev->func);
 
 err_disable_func:
-	sdio_disable_func(bdev->func);
+	/* Keep the MT7668 SDIO function enabled even when the open fails:
+	 * disabling it gates off the Bluetooth core in a way a later
+	 * re-open cannot recover from, exactly as in btmtksdio_close().
+	 * A failed open (e.g. an ownership handshake timeout while the
+	 * Wi-Fi function is downloading the shared CR4 firmware) can
+	 * simply be retried with the function left untouched.
+	 */
+	if (bdev->data->chipid != 0x7668)
+		sdio_disable_func(bdev->func);
 
 err_release_host:
 	sdio_release_host(bdev->func);
@@ -718,11 +777,11 @@ err_release_host:
 	return err;
 }
 
-static int btmtksdio_close(struct hci_dev *hdev)
+static int btmtksdio_close_hw(struct hci_dev *hdev)
 {
 	struct btmtksdio_dev *bdev = hci_get_drvdata(hdev);
 
-	/* Skip btmtksdio_close if BTMTKSDIO_FUNC_ENABLED isn't set */
+	/* Skip btmtksdio_close_hw if BTMTKSDIO_FUNC_ENABLED isn't set */
 	if (!test_bit(BTMTKSDIO_FUNC_ENABLED, &bdev->tx_state))
 		return 0;
 
@@ -733,16 +792,63 @@ static int btmtksdio_close(struct hci_dev *hdev)
 
 	sdio_release_irq(bdev->func);
 
+	sdio_release_host(bdev->func);
+
+	/* The txrx work claims the SDIO host itself, so it must not be
+	 * flushed while the host is still held here: close() would wait
+	 * for the work to finish while the work waits for the host,
+	 * deadlocking both sides (observed on device with hciconfig
+	 * hanging forever in cancel_work_sync()). With the interrupt
+	 * disabled and the IRQ released the work cannot be rearmed, and a
+	 * work that was already pending simply drains once.
+	 */
 	cancel_work_sync(&bdev->txrx_work);
 
-	btmtksdio_fw_pmctrl(bdev);
+	sdio_claim_host(bdev->func);
+
+	/* On the MT7668 combo chip the Bluetooth function is kept powered
+	 * because it cannot be re-enabled once it has been turned off
+	 * (see btmtksdio_shutdown). For the same reason the SDIO function
+	 * must stay enabled and the driver must keep its ownership here:
+	 * tearing the function down makes the chip gate off the Bluetooth
+	 * core in a way a later re-open cannot recover from, and the
+	 * resulting failing handshakes wedge the CR4 the Wi-Fi function
+	 * is running on. The MediaTek vendor driver likewise never tears
+	 * the function down after the initial setup.
+	 */
+	if (bdev->data->chipid != 0x7668) {
+		btmtksdio_fw_pmctrl(bdev);
+		sdio_disable_func(bdev->func);
+	}
 
 	clear_bit(BTMTKSDIO_FUNC_ENABLED, &bdev->tx_state);
-	sdio_disable_func(bdev->func);
 
 	sdio_release_host(bdev->func);
 
 	return 0;
+}
+
+static int btmtksdio_close(struct hci_dev *hdev)
+{
+	struct btmtksdio_dev *bdev = hci_get_drvdata(hdev);
+
+	/* On the MT7668 the MediaTek vendor driver never touches the
+	 * hardware when Bluetooth is turned off -- its power-off path is a
+	 * pure software state change -- and on this chip it has to be
+	 * that way: poking the hardware here (disabling the chip
+	 * interrupt, releasing the IRQ, stopping the work) while the
+	 * firmware keeps running leaves the SDIO engine in a state the
+	 * next open cannot recover from. On device every re-open after
+	 * such a close found the function query reporting off or answered
+	 * with a flood of garbage packets, and the retry path failed from
+	 * then on. Keep the function, interrupts, IRQ and work exactly as
+	 * they are; btmtksdio_remove() still tears the hardware down
+	 * through btmtksdio_close_hw() before unload.
+	 */
+	if (bdev->data->chipid == 0x7668)
+		return 0;
+
+	return btmtksdio_close_hw(hdev);
 }
 
 static int btmtksdio_flush(struct hci_dev *hdev)
@@ -802,6 +908,23 @@ static int mt76xx_setup(struct hci_dev *hdev, const char *fwname)
 
 	if (status == BTMTK_WMT_PATCH_DONE) {
 		bt_dev_info(hdev, "Firmware already downloaded");
+		/* On the MT7668 a re-setup must stop right here. The function
+		 * was enabled by the first setup and is never turned off (the
+		 * close path is a pure software state change), and the
+		 * function query below is unreliable on this chip: it reports
+		 * off for the still-running function. Acting on that misreport
+		 * is fatal -- a WMT func ctrl enable sent to the already-on
+		 * function times out after 10 s and leaves the Bluetooth core
+		 * unresponsive, starving the shared CR4 the Wi-Fi function
+		 * runs on (observed on device: Bluetooth dead, Wi-Fi scans
+		 * timing out forever). The MediaTek vendor driver likewise
+		 * only ever configures the chip once at probe and never pokes
+		 * it again; the HCI init commands the Bluetooth stack issues
+		 * after setup wake and reinitialize the live firmware just
+		 * fine.
+		 */
+		if (bdev->data->chipid == 0x7668)
+			return 0;
 		goto ignore_setup_fw;
 	}
 
@@ -828,6 +951,14 @@ ignore_setup_fw:
 		goto ignore_func_on;
 	}
 
+	/* This enable command is only ever sent right after a fresh firmware
+	 * download above (or for chips that reported their function off at
+	 * probe time): the firmware was just (re)started and its function is
+	 * genuinely not enabled yet, which is the one state in which the
+	 * command is proven to work. On the MT7668 it must never be sent in
+	 * any other state -- see the firmware query handling above.
+	 */
+
 	/* Enable Bluetooth protocol */
 	wmt_params.op = BTMTK_WMT_FUNC_CTRL;
 	wmt_params.flag = 0;
@@ -844,7 +975,16 @@ ignore_setup_fw:
 	set_bit(BTMTKSDIO_PATCH_ENABLED, &bdev->tx_state);
 
 ignore_func_on:
-	/* Apply the low power environment setup */
+	/* Apply the low power environment setup. The MT7668 must keep
+	 * the common values here: the vendor SDIO sleep mode 0x3 with
+	 * 640 ms host durations lets the CR4 -- shared with the Wi-Fi
+	 * function -- enter a sleep state the system cannot recover
+	 * from. On device the Wi-Fi command path stalls a second after
+	 * Bluetooth setup completes (commands starved of TX resources,
+	 * debug PC stuck), and a later Bluetooth re-open finds the chip
+	 * asleep: the function query reports off and commands are
+	 * answered with garbage packets.
+	 */
 	tci_sleep.mode = 0x5;
 	tci_sleep.duration = cpu_to_le16(0x640);
 	tci_sleep.host_duration = cpu_to_le16(0x640);
@@ -870,7 +1010,7 @@ static int mt79xx_setup(struct hci_dev *hdev, const char *fwname)
 	u8 param = 0x1;
 	int err;
 
-	err = btmtk_setup_firmware_79xx(hdev, fwname, mtk_hci_wmt_sync);
+	err = btmtk_setup_firmware_79xx(hdev, fwname, mtk_hci_wmt_sync, 0);
 	if (err < 0) {
 		bt_dev_err(hdev, "Failed to setup 79xx firmware (%d)", err);
 		return err;
@@ -892,10 +1032,8 @@ static int mt79xx_setup(struct hci_dev *hdev, const char *fwname)
 	wmt_params.status = NULL;
 
 	err = mtk_hci_wmt_sync(hdev, &wmt_params);
-	if (err < 0) {
+	if (err < 0)
 		bt_dev_err(hdev, "Failed to send wmt func ctrl (%d)", err);
-		return err;
-	}
 
 	hci_set_msft_opcode(hdev, 0xFD30);
 	hci_set_aosp_capable(hdev);
@@ -1090,6 +1228,7 @@ static int btmtksdio_setup(struct hci_dev *hdev)
 	set_bit(BTMTKSDIO_HW_TX_READY, &bdev->tx_state);
 
 	switch (bdev->data->chipid) {
+	case 0x7902:
 	case 0x7921:
 		if (test_bit(BTMTKSDIO_HW_RESET_ACTIVE, &bdev->tx_state)) {
 			err = btmtksdio_mtk_reg_read(hdev, MT7921_DLSTATUS,
@@ -1167,22 +1306,24 @@ static int btmtksdio_setup(struct hci_dev *hdev)
 	delta = ktime_sub(rettime, calltime);
 	duration = (unsigned long long)ktime_to_ns(delta) >> 10;
 
-	pm_runtime_set_autosuspend_delay(bdev->dev,
-					 MTKBTSDIO_AUTOSUSPEND_DELAY);
-	pm_runtime_use_autosuspend(bdev->dev);
+	if (bdev->data->pm_runtime_supported) {
+		pm_runtime_set_autosuspend_delay(bdev->dev,
+						 MTKBTSDIO_AUTOSUSPEND_DELAY);
+		pm_runtime_use_autosuspend(bdev->dev);
 
-	err = pm_runtime_set_active(bdev->dev);
-	if (err < 0)
-		return err;
+		err = pm_runtime_set_active(bdev->dev);
+		if (err < 0)
+			return err;
 
-	/* Default forbid runtime auto suspend, that can be allowed by
-	 * enable_autosuspend flag or the PM runtime entry under sysfs.
-	 */
-	pm_runtime_forbid(bdev->dev);
-	pm_runtime_enable(bdev->dev);
+		/* Default forbid runtime auto suspend, that can be allowed by
+		 * enable_autosuspend flag or the PM runtime entry under sysfs.
+		 */
+		pm_runtime_forbid(bdev->dev);
+		pm_runtime_enable(bdev->dev);
 
-	if (enable_autosuspend)
-		pm_runtime_allow(bdev->dev);
+		if (enable_autosuspend)
+			pm_runtime_allow(bdev->dev);
+	}
 
 	bt_dev_info(hdev, "Device setup in %llu usecs", duration);
 
@@ -1205,17 +1346,30 @@ static int btmtksdio_shutdown(struct hci_dev *hdev)
 	if (test_bit(BTMTKSDIO_HW_RESET_ACTIVE, &bdev->tx_state))
 		goto ignore_wmt_cmd;
 
-	/* Disable the device */
-	wmt_params.op = BTMTK_WMT_FUNC_CTRL;
-	wmt_params.flag = 0;
-	wmt_params.dlen = sizeof(param);
-	wmt_params.data = &param;
-	wmt_params.status = NULL;
+	/* The MT7668 is a Wi-Fi/Bluetooth combo chip whose Bluetooth
+	 * function shares the CR4 processor and its data RAM with the
+	 * Wi-Fi function. Powering the Bluetooth function off here leaves
+	 * the chip in a state that a plain WMT func ctrl power-on at the
+	 * next setup cannot recover from: the enable command times out
+	 * and the device eventually even stops granting driver ownership,
+	 * which breaks every re-open until the chip is power cycled.
+	 * Keep the function powered instead -- the same model the
+	 * MediaTek vendor driver uses, where Bluetooth is powered on once
+	 * at setup and is never turned off afterwards.
+	 */
+	if (bdev->data->chipid != 0x7668) {
+		/* Disable the device */
+		wmt_params.op = BTMTK_WMT_FUNC_CTRL;
+		wmt_params.flag = 0;
+		wmt_params.dlen = sizeof(param);
+		wmt_params.data = &param;
+		wmt_params.status = NULL;
 
-	err = mtk_hci_wmt_sync(hdev, &wmt_params);
-	if (err < 0) {
-		bt_dev_err(hdev, "Failed to send wmt func ctrl (%d)", err);
-		return err;
+		err = mtk_hci_wmt_sync(hdev, &wmt_params);
+		if (err < 0) {
+			bt_dev_err(hdev, "Failed to send wmt func ctrl (%d)", err);
+			return err;
+		}
 	}
 
 ignore_wmt_cmd:
@@ -1223,6 +1377,44 @@ ignore_wmt_cmd:
 	pm_runtime_disable(bdev->dev);
 
 	return 0;
+}
+
+static int btmtksdio_combo_setup(struct hci_dev *hdev)
+{
+	struct btmtksdio_dev *bdev = hci_get_drvdata(hdev);
+	struct mt7663_combo *combo = bdev->combo;
+	int ret;
+
+	if (!combo)
+		return btmtksdio_setup(hdev);
+	mutex_lock(&combo->transition);
+	if (combo->removing) {
+		mutex_unlock(&combo->transition);
+		return -ENODEV;
+	}
+	reinit_completion(&combo->setup_done);
+	combo->setup_status = -EINPROGRESS;
+	ret = btmtksdio_setup(hdev);
+	combo->setup_status = ret ? ret : -EINPROGRESS;
+	if (ret)
+		complete_all(&combo->setup_done);
+	dev_dbg(bdev->dev, "W103D: combo Bluetooth setup result=%d\n", ret);
+	mutex_unlock(&combo->transition);
+	return ret;
+}
+
+static int btmtksdio_combo_shutdown(struct hci_dev *hdev)
+{
+	struct btmtksdio_dev *bdev = hci_get_drvdata(hdev);
+	int ret;
+
+	if (bdev->combo)
+		mutex_lock(&bdev->combo->transition);
+	ret = btmtksdio_shutdown(hdev);
+	/* FUNC_CTRL off does not undo the shared ROM patch setup. */
+	if (bdev->combo)
+		mutex_unlock(&bdev->combo->transition);
+	return ret;
 }
 
 static int btmtksdio_send_frame(struct hci_dev *hdev, struct sk_buff *skb)
@@ -1378,8 +1570,9 @@ static int btmtksdio_probe(struct sdio_func *func,
 	hdev->close    = btmtksdio_close;
 	hdev->reset    = btmtksdio_reset;
 	hdev->flush    = btmtksdio_flush;
-	hdev->setup    = btmtksdio_setup;
-	hdev->shutdown = btmtksdio_shutdown;
+	hdev->setup    = btmtksdio_combo_setup;
+	hdev->post_init = btmtksdio_combo_post_init;
+	hdev->shutdown = btmtksdio_combo_shutdown;
 	hdev->send     = btmtksdio_send_frame;
 	hdev->wakeup   = btmtksdio_sdio_wakeup;
 	/*
@@ -1398,6 +1591,12 @@ static int btmtksdio_probe(struct sdio_func *func,
 	hci_set_quirk(hdev, HCI_QUIRK_NON_PERSISTENT_SETUP);
 
 	sdio_set_drvdata(func, bdev);
+
+	err = btmtksdio_combo_register(bdev);
+	if (err) {
+		hci_free_dev(hdev);
+		return err;
+	}
 
 	err = hci_register_dev(hdev);
 	if (err < 0) {
@@ -1458,11 +1657,15 @@ static void btmtksdio_remove(struct sdio_func *func)
 	if (!bdev)
 		return;
 
+	btmtksdio_combo_detach(bdev->combo);
 	hdev = bdev->hdev;
 
-	/* Make sure to call btmtksdio_close before removing sdio card */
+	/* Make sure to call btmtksdio_close_hw before removing sdio card */
 	if (test_bit(BTMTKSDIO_FUNC_ENABLED, &bdev->tx_state))
-		btmtksdio_close(hdev);
+		btmtksdio_close_hw(hdev);
+
+	if (bdev->data->pm_runtime_supported)
+		pm_runtime_dont_use_autosuspend(bdev->dev);
 
 	/* Be consistent the state in btmtksdio_probe */
 	pm_runtime_get_noresume(bdev->dev);

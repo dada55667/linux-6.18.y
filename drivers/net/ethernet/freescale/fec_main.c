@@ -2494,8 +2494,19 @@ static int fec_enet_mii_probe(struct net_device *ndev)
 	} else {
 		/* check for attached phy */
 		phy_dev = phy_find_first(fep->mii_bus);
-		if (fep->dev_id && phy_dev)
-			phy_dev = phy_find_next(fep->mii_bus, phy_dev);
+		if (fep->dev_id && phy_dev) {
+			/* this tree's PHY core has no phy_find_next();
+			 * walk the bus manually for the next PHY */
+			struct phy_device *next = NULL;
+			int addr;
+
+			for (addr = phy_dev->mdio.addr + 1; addr < PHY_MAX_ADDR; addr++) {
+				next = mdiobus_get_phy(fep->mii_bus, addr);
+				if (next)
+					break;
+			}
+			phy_dev = next;
+		}
 
 		if (!phy_dev) {
 			netdev_info(ndev, "no PHY, assuming direct connection to switch\n");
@@ -3337,8 +3348,15 @@ static void fec_enet_free_buffers(struct net_device *ndev)
 
 	for (q = 0; q < fep->num_rx_queues; q++) {
 		rxq = fep->rx_queue[q];
-		for (i = 0; i < rxq->bd.ring_size; i++)
-			page_pool_put_full_page(rxq->page_pool, rxq->rx_skb_info[i].page, false);
+		for (i = 0; i < rxq->bd.ring_size; i++) {
+			struct page *page = rxq->rx_skb_info[i].page;
+
+			if (!page)
+				continue;
+
+			page_pool_put_full_page(rxq->page_pool, page, false);
+			rxq->rx_skb_info[i].page = NULL;
+		}
 
 		for (i = 0; i < XDP_STATS_TOTAL; i++)
 			rxq->stats[i] = 0;
@@ -4635,7 +4653,8 @@ failed_mii_init:
 failed_irq:
 	fec_enet_deinit(ndev);
 failed_init:
-	fec_ptp_stop(pdev);
+	if (fep->bufdesc_ex)
+		fec_ptp_stop(pdev);
 failed_reset:
 	pm_runtime_put_noidle(&pdev->dev);
 	pm_runtime_disable(&pdev->dev);
@@ -4677,7 +4696,8 @@ fec_drv_remove(struct platform_device *pdev)
 			ERR_PTR(ret));
 
 	cancel_work_sync(&fep->tx_timeout_work);
-	fec_ptp_stop(pdev);
+	if (fep->bufdesc_ex)
+		fec_ptp_stop(pdev);
 	unregister_netdev(ndev);
 	fec_enet_mii_remove(fep);
 	if (fep->reg_phy)

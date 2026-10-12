@@ -5,7 +5,7 @@
 # r8126 is the Linux device driver released for Realtek 5 Gigabit Ethernet
 # controllers with PCI-Express interface.
 #
-# Copyright(c) 2024 Realtek Semiconductor Corp. All rights reserved.
+# Copyright(c) 2026 Realtek Semiconductor Corp. All rights reserved.
 #
 # This program is free software; you can redistribute it and/or modify it
 # under the terms of the GNU General Public License as published by the Free
@@ -575,6 +575,8 @@ void rtl8126_config_rss(struct rtl8126_private *tp)
 void rtl8126_init_rss(struct rtl8126_private *tp)
 {
         int i;
+
+        tp->rss_flags = RTL8126_UDP_RSS_FLAGS;
 
         for (i = 0; i < rtl8126_rss_indir_tbl_entries(tp); i++)
                 tp->rss_indir_tbl[i] = ethtool_rxfh_indir_default(i, tp->num_rx_rings);

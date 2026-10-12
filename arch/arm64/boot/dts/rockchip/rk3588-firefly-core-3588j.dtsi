@@ -112,6 +112,10 @@
 	domain-supply = <&vdd_gpu_s0>;
 };
 
+&pd_npu {
+	domain-supply = <&vdd_npu_s0>;
+};
+
 &sdhci {
 	bus-width = <8>;
 	no-sdio;
@@ -443,5 +447,6 @@
 /* rk3588 preferred debug out */
 &uart2 {
 	pinctrl-0 = <&uart2m0_xfer>;
+	pinctrl-names = "default";
 	status = "okay";
 };

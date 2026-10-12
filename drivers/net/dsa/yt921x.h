@@ -230,6 +230,32 @@
 #define  YT921X_MIB_DATA_RX_OAM			0xa8
 #define  YT921X_MIB_DATA_TX_OAM			0xac
 
+/* Parallel LED controller. Action bits are per-port per-LED; LED0 has two
+ * extra bits (16-17). Bit values follow the vendor SDK (fal_tiger_led.c).
+ */
+#define YT921X_LED_GLB_CTRL		0xd0000
+#define  YT921X_LED_GLB_ENABLE			BIT(21)
+#define YT921X_LED_CTRL_0(port)		(0xd0004 + 4 * (port))
+#define YT921X_LED_CTRL_1(port)		(0xd0040 + 4 * (port))
+#define YT921X_LED_CTRL_2(port)		(0xd0080 + 4 * (port))
+#define  YT921X_LED_10M_BLINK			BIT(0)
+#define  YT921X_LED_100M_BLINK			BIT(1)
+#define  YT921X_LED_1000M_BLINK			BIT(2)
+#define  YT921X_LED_10M_ON			BIT(4)
+#define  YT921X_LED_100M_ON			BIT(5)
+#define  YT921X_LED_1000M_ON			BIT(6)
+#define  YT921X_LED_RXACT_ON			BIT(7)
+#define  YT921X_LED_TXACT_ON			BIT(8)
+#define  YT921X_LED_RXACT_BLINK			BIT(9)
+#define  YT921X_LED_TXACT_BLINK			BIT(10)
+#define  YT921X_LED_HALFDUPLEX_ON		BIT(11)
+#define  YT921X_LED_FULLDUPLEX_ON		BIT(12)
+#define  YT921X_LED_ACT_BLINK_IND		BIT(13)
+#define  YT921X_LED_LOOPDETECT_IND		BIT(14)
+#define  YT921X_LED_EEE_IND			BIT(15)
+#define  YT921X_LED_COLLISION_BLINK		BIT(16)	/* LED0 only */
+#define  YT921X_LED_DISABLE_LINK_TRY		BIT(17)	/* LED0 only */
+
 #define YT921X_EDATA_CTRL		0xe0000
 #define  YT921X_EDATA_CTRL_ADDR_M		GENMASK(15, 8)
 #define   YT921X_EDATA_CTRL_ADDR(x)			FIELD_PREP(YT921X_EDATA_CTRL_ADDR_M, (x))
@@ -854,7 +880,7 @@ enum yt921x_fdb_entry_status {
 #define YT921X_PORT_NUM			11
 
 #define yt921x_port_is_internal(port) ((port) < 8)
-#define yt921x_port_is_external(port) (8 <= (port) && (port) < 9)
+#define yt921x_port_is_external(port) (8 <= (port) && (port) < 10)
 
 struct yt921x_mib {
 	u64 rx_broadcast;

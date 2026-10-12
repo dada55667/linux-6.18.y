@@ -31,25 +31,6 @@ config R8126_REALWOW_SUPPORT
 	  Support Realtek RealWOW Technology.
 	  If unsure, say N.
 
-config R8126_DASH_SUPPORT
-	bool "Enable Realtek Dash Management Console"
-	default n
-	depends on R8126
-	help
-	  This enables ENABLE_DASH_SUPPORT flag.
-	  Support Realtek Dash Management Console.
-	  If unsure, say N.
-
-config R8126_DASH_PRINT_SUPPORT
-	bool "Enable Realtek Dash Print"
-	default n
-	depends on R8126
-	depends on R8126_DASH_SUPPORT
-	help
-	  This enables ENABLE_DASH_PRINTER_SUPPORT flag.
-	  Support Realtek Dash Print.
-	  If unsure, say N.
-
 config R8126_DOWN_SPEED_100
 	bool "Down speed 100"
 	default n
@@ -160,7 +141,7 @@ config R8126_PTP_SUPPORT
 
 config R8126_FIBER_SUPPORT
 	bool "Enable fiber support"
-	default y
+	default n
 	depends on R8126
 	help
 	  This enables DENABLE_FIBER_SUPPORT flag.
@@ -184,7 +165,7 @@ config R8126_DOUBLE_VLAN
 
 config R8126_PAGE_REUSE
 	bool "Enable page reuse"
-	default n
+	default y
 	depends on R8126
 	help
 	  This enables ENABLE_PAGE_REUSE flag.

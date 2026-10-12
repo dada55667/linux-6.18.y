@@ -27,6 +27,7 @@
 #include <linux/interrupt.h>
 #include <linux/bitfield.h>
 #include <linux/pinctrl/consumer.h>
+#include <linux/slab.h>
 
 #define DRIVER_NAME "meson-gx-mmc"
 
@@ -161,9 +162,13 @@ struct meson_host {
 	bool ddr;
 
 	bool dram_access_quirk;
+	bool sdio_irq_fastpath;
 
 	struct pinctrl *pinctrl;
+	struct pinctrl_state *pins_active;
 	struct pinctrl_state *pins_clk_gate;
+	struct pinctrl_state *pins_sdio_transfer;
+	struct pinctrl_state *pins_sdio_transfer_clk_gate;
 
 	unsigned int bounce_buf_size;
 	void *bounce_buf;
@@ -341,8 +346,12 @@ static void meson_mmc_clk_ungate(struct meson_host *host)
 {
 	u32 cfg;
 
-	if (host->pins_clk_gate)
-		pinctrl_select_default_state(host->dev);
+	if (host->pins_clk_gate) {
+		if (host->pins_active)
+			pinctrl_select_state(host->pinctrl, host->pins_active);
+		else
+			pinctrl_select_default_state(host->dev);
+	}
 
 	/* Make sure the clock is not stopped in the controller */
 	cfg = readl(host->regs + SD_EMMC_CFG);
@@ -528,6 +537,26 @@ static int meson_mmc_resampling_tuning(struct mmc_host *mmc, u32 opcode)
 	struct meson_host *host = mmc_priv(mmc);
 	unsigned int val, dly, max_dly, i;
 	int ret;
+
+	if (host->pins_sdio_transfer &&
+	    host->pins_active != host->pins_sdio_transfer) {
+		ret = pinctrl_select_state(host->pinctrl,
+					   host->pins_sdio_transfer);
+		if (ret)
+			return ret;
+
+		host->pins_active = host->pins_sdio_transfer;
+		host->pins_clk_gate = host->pins_sdio_transfer_clk_gate;
+
+		val = readl(host->regs + host->data->adjust);
+		val &= ~ADJUST_ADJ_DELAY_MASK;
+		val |= ADJUST_ADJ_EN;
+		val |= FIELD_PREP(ADJUST_ADJ_DELAY_MASK, 3);
+		writel(val, host->regs + host->data->adjust);
+		dev_dbg(host->dev,
+			      "switched to SDIO transfer routing with vendor delay 3\n");
+		return 0;
+	}
 
 	/* Resampling is done using the source clock */
 	max_dly = DIV_ROUND_UP(clk_get_rate(host->mux_clk),
@@ -741,51 +770,37 @@ static void meson_mmc_desc_chain_transfer(struct mmc_host *mmc, u32 cmd_cfg)
 	writel(start, host->regs + SD_EMMC_START);
 }
 
-/* local sg copy for dram_access_quirk */
+/* Copy arbitrary SG data through the word-access-only controller SRAM. */
 static void meson_mmc_copy_buffer(struct meson_host *host, struct mmc_data *data,
 				  size_t buflen, bool to_buffer)
 {
-	unsigned int sg_flags = SG_MITER_ATOMIC;
-	struct scatterlist *sgl = data->sg;
-	unsigned int nents = data->sg_len;
-	struct sg_mapping_iter miter;
-	unsigned int offset = 0;
+	size_t io_len = ALIGN(buflen, sizeof(u32));
+	u32 *staging = host->bounce_buf;
+	size_t copied;
 
-	if (to_buffer)
-		sg_flags |= SG_MITER_FROM_SG;
-	else
-		sg_flags |= SG_MITER_TO_SG;
+	if (WARN_ON_ONCE(buflen > host->bounce_buf_size))
+		return;
 
-	sg_miter_start(&miter, sgl, nents, sg_flags);
+	if (to_buffer) {
+		copied = sg_copy_to_buffer(data->sg, data->sg_len,
+					   staging, buflen);
+		if (WARN_ON_ONCE(copied != buflen))
+			return;
 
-	while ((offset < buflen) && sg_miter_next(&miter)) {
-		unsigned int buf_offset = 0;
-		unsigned int len, left;
-		u32 *buf = miter.addr;
+		if (io_len > buflen)
+			memset((u8 *)staging + buflen, 0, io_len - buflen);
 
-		len = min(miter.length, buflen - offset);
-		left = len;
-
-		if (to_buffer) {
-			do {
-				writel(*buf++, host->bounce_iomem_buf + offset + buf_offset);
-
-				buf_offset += 4;
-				left -= 4;
-			} while (left);
-		} else {
-			do {
-				*buf++ = readl(host->bounce_iomem_buf + offset + buf_offset);
-
-				buf_offset += 4;
-				left -= 4;
-			} while (left);
-		}
-
-		offset += len;
+		__iowrite32_copy(host->bounce_iomem_buf, staging,
+				 io_len / sizeof(u32));
+		return;
 	}
 
-	sg_miter_stop(&miter);
+	__ioread32_copy(staging, host->bounce_iomem_buf,
+			  io_len / sizeof(u32));
+
+	copied = sg_copy_from_buffer(data->sg, data->sg_len,
+				     staging, buflen);
+	WARN_ON_ONCE(copied != buflen);
 }
 
 static void meson_mmc_start_cmd(struct mmc_host *mmc, struct mmc_command *cmd)
@@ -853,42 +868,11 @@ static void meson_mmc_start_cmd(struct mmc_host *mmc, struct mmc_command *cmd)
 	writel(cmd->arg, host->regs + SD_EMMC_CMD_ARG);
 }
 
-static int meson_mmc_validate_dram_access(struct mmc_host *mmc, struct mmc_data *data)
-{
-	struct scatterlist *sg;
-	int i;
-
-	/* Reject request if any element offset or size is not 32bit aligned */
-	for_each_sg(data->sg, sg, data->sg_len, i) {
-		if (!IS_ALIGNED(sg->offset, sizeof(u32)) ||
-		    !IS_ALIGNED(sg->length, sizeof(u32))) {
-			dev_err(mmc_dev(mmc), "unaligned sg offset %u len %u\n",
-				data->sg->offset, data->sg->length);
-			return -EINVAL;
-		}
-	}
-
-	return 0;
-}
-
 static void meson_mmc_request(struct mmc_host *mmc, struct mmc_request *mrq)
 {
 	struct meson_host *host = mmc_priv(mmc);
 	host->needs_pre_post_req = mrq->data &&
 			!(mrq->data->host_cookie & SD_EMMC_PRE_REQ_DONE);
-
-	/*
-	 * The memory at the end of the controller used as bounce buffer for
-	 * the dram_access_quirk only accepts 32bit read/write access,
-	 * check the alignment and length of the data before starting the request.
-	 */
-	if (host->dram_access_quirk && mrq->data) {
-		mrq->cmd->error = meson_mmc_validate_dram_access(mmc, mrq->data);
-		if (mrq->cmd->error) {
-			mmc_request_done(mmc, mrq);
-			return;
-		}
-	}
 
 	if (host->needs_pre_post_req) {
 		meson_mmc_get_transfer_mode(mmc, mrq);
@@ -988,6 +972,23 @@ static irqreturn_t meson_mmc_irq(int irq, void *dev_id)
 
 		if (data && !cmd->error)
 			data->bytes_xfered = data->blksz * data->blocks;
+
+		/* W103D's schedutil worker can delay the threaded completion
+		 * by a millisecond per SDIO transaction. Successful terminal
+		 * CMD52/CMD53 requests need no sleeping work when there is no
+		 * bounce read. DMA unmapping and the MMC completion callback
+		 * are IRQ-safe; do not touch host/cmd after waking the waiter.
+		 * Keep errors, bounce copies and command chains in the thread.
+		 */
+		if (host->sdio_irq_fastpath &&
+		    (cmd->opcode == SD_IO_RW_DIRECT ||
+		     cmd->opcode == SD_IO_RW_EXTENDED) &&
+		    (!data || !data->error) &&
+		    !meson_mmc_bounce_buf_read(data) &&
+		    !meson_mmc_get_next_command(cmd)) {
+			meson_mmc_request_done(host->mmc, cmd->mrq);
+			return IRQ_HANDLED;
+		}
 
 		return IRQ_WAKE_THREAD;
 	}
@@ -1155,7 +1156,6 @@ static int meson_mmc_probe(struct platform_device *pdev)
 	/* The G12A SDIO Controller needs an SRAM bounce buffer */
 	host->dram_access_quirk = device_property_read_bool(&pdev->dev,
 					"amlogic,dram-access-quirk");
-
 	/* Get regulators and the supported OCR mask */
 	ret = mmc_regulator_get_supply(mmc);
 	if (ret)
@@ -1201,6 +1201,22 @@ static int meson_mmc_probe(struct platform_device *pdev)
 		host->pins_clk_gate = NULL;
 	}
 
+	host->pins_active = pinctrl_lookup_state(host->pinctrl,
+						 PINCTRL_STATE_DEFAULT);
+	if (IS_ERR(host->pins_active))
+		host->pins_active = NULL;
+
+	host->pins_sdio_transfer = pinctrl_lookup_state(host->pinctrl,
+							"sdio-transfer");
+	host->pins_sdio_transfer_clk_gate =
+		pinctrl_lookup_state(host->pinctrl,
+				     "sdio-transfer-clk-gate");
+	if (IS_ERR(host->pins_sdio_transfer) ||
+	    IS_ERR(host->pins_sdio_transfer_clk_gate)) {
+		host->pins_sdio_transfer = NULL;
+		host->pins_sdio_transfer_clk_gate = NULL;
+	}
+
 	core_clk = devm_clk_get_enabled(&pdev->dev, "core");
 	if (IS_ERR(core_clk))
 		return PTR_ERR(core_clk);
@@ -1219,6 +1235,11 @@ static int meson_mmc_probe(struct platform_device *pdev)
 	writel(0, host->regs + SD_EMMC_IRQ_EN);
 	writel(IRQ_EN_MASK, host->regs + SD_EMMC_STATUS);
 	writel(IRQ_EN_MASK, host->regs + SD_EMMC_IRQ_EN);
+
+	host->sdio_irq_fastpath = of_machine_is_compatible("zte,w103d") &&
+				  !host->dram_access_quirk;
+	if (host->sdio_irq_fastpath)
+		dev_dbg(host->dev, "W103D: direct completion for copy-free SDIO requests\n");
 
 	ret = request_threaded_irq(host->irq, meson_mmc_irq,
 				   meson_mmc_irq_thread, IRQF_ONESHOT,
@@ -1254,9 +1275,16 @@ static int meson_mmc_probe(struct platform_device *pdev)
 		 * The MMC Controller embeds 1,5KiB of internal SRAM
 		 * that can be used to be used as bounce buffer.
 		 * In the case of the G12A SDIO controller, use these
-		 * instead of the DDR memory
+		 * instead of the DDR memory.  Keep a normal-memory staging
+		 * buffer so arbitrary SG layouts never cause unaligned MMIO.
 		 */
 		host->bounce_buf_size = SD_EMMC_SRAM_DATA_BUF_LEN;
+		host->bounce_buf = devm_kzalloc(host->dev,
+						 host->bounce_buf_size, GFP_KERNEL);
+		if (!host->bounce_buf) {
+			ret = -ENOMEM;
+			goto err_free_irq;
+		}
 		host->bounce_iomem_buf = host->regs + SD_EMMC_SRAM_DATA_BUF_OFF;
 		host->bounce_dma_addr = res->start + SD_EMMC_SRAM_DATA_BUF_OFF;
 	} else {

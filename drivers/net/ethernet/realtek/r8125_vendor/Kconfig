@@ -34,22 +34,11 @@ config R8125_REALWOW_SUPPORT
 
 config R8125_DASH_SUPPORT
 	bool "Enable Realtek Dash Management Console"
-	default n
+	default y
 	depends on R8125
 	help
 	  This enables ENABLE_DASH_SUPPORT flag.
 	  Support Realtek Dash Management Console.
-	  If unsure, say N.
-
-config R8125_DASH_PRINT_SUPPORT
-	bool "Enable Realtek Dash Print"
-	default n
-	depends on R8125
-	depends on R8125_DASH_SUPPORT
-	help
-	  This enables ENABLE_DASH_PRINTER_SUPPORT flag.
-	  Support Realtek Dash Print.
-	  If unsure, say N.
 
 config R8125_DOWN_SPEED_100
 	bool "Down speed 100"
@@ -159,15 +148,6 @@ config R8125_PTP_SUPPORT
 	  This enables ENABLE_PTP_SUPPORT flag.
 	  Support IEEE 1588 PTP Clock.
 
-config R8125_PTP_MASTER_MODE
-	bool "Enable PTP Master mode"
-	default n
-	depends on R8125
-	depends on R8125_PTP_SUPPORT
-	help
-	  This enables ENABLE_PTP_MASTER_MODE flag.
-	  Enable PTP master mode.
-
 config R8125_FIBER_SUPPORT
 	bool "Enable fiber support"
 	default y
@@ -194,11 +174,10 @@ config R8125_DOUBLE_VLAN
 
 config R8125_PAGE_REUSE
 	bool "Enable page reuse"
-	default n
+	default y
 	depends on R8125
 	help
 	  This enables ENABLE_PAGE_REUSE flag.
-	  If unsure, say N.
 
 config R8125_GIGA_LITE
 	bool "Supports Giga Lite (500M) mode"
