@@ -461,16 +461,6 @@ static void socfpga_agilex5_setup_plat_dat(struct socfpga_dwmac *dwmac)
 	plat_dat->core_type = DWMAC_CORE_XGMAC;
 }
 
-static void socfpga_gen5_setup_plat_dat(struct socfpga_dwmac *dwmac)
-{
-	struct plat_stmmacenet_data *plat_dat = dwmac->plat_dat;
-
-	plat_dat->core_type = DWMAC_CORE_GMAC;
-
-	/* Rx watchdog timer in dwmac is buggy in this hw */
-	plat_dat->riwt_off = 1;
-}
-
 static void socfpga_agilex5_setup_plat_dat(struct socfpga_dwmac *dwmac)
 {
 	struct plat_stmmacenet_data *plat_dat = dwmac->plat_dat;
