@@ -454,12 +454,6 @@ static void socfpga_gen5_setup_plat_dat(struct socfpga_dwmac *dwmac)
 	plat_dat->riwt_off = true;
 }
 
-static void socfpga_agilex5_setup_plat_dat(struct socfpga_dwmac *dwmac)
-{
-	struct plat_stmmacenet_data *plat_dat = dwmac->plat_dat;
-
-	plat_dat->core_type = DWMAC_CORE_XGMAC;
-}
 
 static void socfpga_agilex5_setup_plat_dat(struct socfpga_dwmac *dwmac)
 {
