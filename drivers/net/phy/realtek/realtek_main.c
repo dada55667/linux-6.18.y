@@ -822,7 +822,6 @@ static int rtl8211f_config_phy_eee(struct phy_device *phydev)
 static int rtl8211f_config_init(struct phy_device *phydev)
 {
 	struct device *dev = &phydev->mdio.dev;
-	struct rtl821x_priv *priv = phydev->priv;
 	int ret;
 
 	ret = rtl8211f_config_aldps(phydev);
