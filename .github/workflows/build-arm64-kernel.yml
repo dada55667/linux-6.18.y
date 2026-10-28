@@ -4,103 +4,171 @@ on:
   workflow_dispatch:
     inputs:
       tag_name:
-        description: "Release Tag"
+        description: "Release Tag（若已存在会自动加 -r<run_number>）"
         required: true
         default: "6.18.0-test"
+      config:
+        description: "内核配置来源（仓库内相对路径；留空则用 arch/arm64/configs/defconfig）"
+        required: false
+        default: ""
+      extra_config:
+        description: "额外 config 覆盖，逗号或空格分隔，例如 CONFIG_ACPI=n,CONFIG_LOCALVERSION=-oect"
+        required: false
+        default: ""
+      create_release:
+        description: "编译成功后是否创建 Release"
+        type: boolean
+        default: true
+
+# 创建 Release 需要写权限（默认 token 是只读的，缺这段会 403）
+permissions:
+  contents: write
+
+concurrency:
+  group: build-arm64-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  ARCH: arm64
+  CROSS_COMPILE: aarch64-linux-gnu-
+  LC_ALL: C
 
 jobs:
   build:
     runs-on: ubuntu-24.04
-    
-    env:
-      ARCH: arm64
-      CROSS_COMPILE: aarch64-linux-gnu-
+    timeout-minutes: 150
 
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v4
         with:
           fetch-depth: 1
 
-      - name: Install dependencies
+      - name: 查看 runner 资源
+        run: |
+          echo "=== CPU / 内存 / 磁盘 ==="
+          nproc
+          free -h || true
+          df -h /
+
+      - name: 安装构建依赖
         run: |
           sudo apt-get update
           sudo apt-get install -y \
-            build-essential bison flex \
-            libssl-dev libelf-dev \
-            gcc-13-aarch64-linux-gnu \
-            binutils-aarch64-linux-gnu \
-            kmod cpio u-boot-tools
+            build-essential bc bison flex rsync cpio kmod zip \
+            libssl-dev libelf-dev libncurses-dev libgnutls28-dev \
+            device-tree-compiler dwarves python3 \
+            gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu \
+            u-boot-tools
 
-      - name: Setup compiler
+      - name: 确认工具链
         run: |
-          sudo update-alternatives --install \
-            /usr/bin/aarch64-linux-gnu-gcc \
-            aarch64-linux-gnu-gcc \
-            /usr/bin/aarch64-linux-gnu-gcc-13 100
+          aarch64-linux-gnu-gcc --version | head -1
+          aarch64-linux-gnu-ld --version | head -1
+          make --version | head -1
+          bc --version | head -1
+          pahole --version || true
 
-      - name: List available arm64 configs
+      - name: 配置内核
         run: |
-          echo "=== Available arm64 configs ==="
-          ls arch/arm64/configs/ 2>/dev/null || echo "No arm64 configs"
-          echo ""
-          echo "=== Top-level defconfigs ==="
-          ls -la arch/arm64/configs/*defconfig* 2>/dev/null
-
-      - name: Configure kernel
-        run: |
+          set -euo pipefail
           rm -rf out
-          
-          # 尝试多个配置来源
-          if [ -f "arch/arm64/configs/defconfig" ]; then
-            echo "Using arch/arm64/configs/defconfig"
-            make O=out ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- defconfig
-          elif [ -f ".config" ]; then
-            echo "Using existing .config"
+
+          CFG="${{ github.event.inputs.config }}"
+          if [ -n "$CFG" ]; then
+            echo "使用自定义配置: $CFG"
             mkdir -p out
-            cp .config out/.config
-            make O=out ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- olddefconfig
+            cp "$CFG" out/.config
+            make O=out ARCH=arm64 CROSS_COMPILE=$CROSS_COMPILE olddefconfig
           else
-            echo "Creating minimal arm64 config"
-            make O=out ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- defconfig
+            echo "使用 arch/arm64/configs/defconfig"
+            make O=out ARCH=arm64 CROSS_COMPILE=$CROSS_COMPILE defconfig
           fi
-          
-          # 关键修复：禁用 ACPI（arm64 设备树系统不需要）
-          scripts/config --file out/.config --disable CONFIG_ACPI
-          
-          # 显示配置状态
-          grep CONFIG_ACPI out/.config
-          make O=out ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- olddefconfig
 
-      - name: Build kernel
-        run: |
-          make O=out ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- -j$(nproc)
+          # 额外覆盖项：CONFIG_X=y / CONFIG_X=n / CONFIG_X="str"
+          EXTRA="${{ github.event.inputs.extra_config }}"
+          EXTRA="${EXTRA//,/ }"
+          if [ -n "${EXTRA// /}" ]; then
+            for opt in $EXTRA; do
+              key="${opt%%=*}"
+              val="${opt#*=}"
+              echo "覆盖: $key = $val"
+              scripts/config --file out/.config --set-val "$key" "$val"
+            done
+            make O=out ARCH=arm64 CROSS_COMPILE=$CROSS_COMPILE olddefconfig
+          fi
 
-      - name: Package
+          echo "=== 关键配置项 ==="
+          grep -E '^CONFIG_(ACPI|PCI|MODULES|WERROR|DEBUG_INFO)=' out/.config || true
+          cp out/.config out/.config.used
+
+      - name: 编译内核
         run: |
+          set -o pipefail
+          make O=out ARCH=arm64 CROSS_COMPILE=$CROSS_COMPILE -j"$(nproc)" 2>&1 | tee build.log
+
+      - name: 输出真实报错（失败时）
+        if: failure()
+        run: |
+          if [ ! -f build.log ]; then
+            echo "build.log 不存在 —— 失败发生在编译之前"
+            exit 0
+          fi
+          echo "=========== 最后 40 行 ==========="
+          tail -n 40 build.log
+          echo "=========== 关键 error 行 ==========="
+          grep -n -E "error:|fatal error|Error [0-9]+|undefined reference|No rule to make target|No space left|Killed" build.log | head -n 30 || true
+          # 把关键报错变成 annotation（可在 Actions 页和 API 直接读到）
+          echo "=========== annotations ==========="
+          grep -E "error:|fatal error|Error [0-9]+|No rule to make target|No space left|Killed" build.log | head -n 15 | cut -c1-900 | tr -d '\r' | while IFS= read -r line; do
+            printf '::error::%s\n' "$line"
+          done
+
+      - name: 上传构建日志
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log-run${{ github.run_number }}
+          path: |
+            build.log
+            out/.config.used
+          retention-days: 14
+          if-no-files-found: warn
+
+      - name: 打包产物
+        if: success()
+        run: |
+          set -euo pipefail
           mkdir -p release
-          if [ -f "out/arch/arm64/boot/Image" ]; then
-            cp out/arch/arm64/boot/Image release/
-          fi
-          if [ -f "out/arch/arm64/boot/Image.gz" ]; then
-            cp out/arch/arm64/boot/Image.gz release/
-          fi
-          if [ -d "out/arch/arm64/boot/dts" ]; then
+          if [ -f out/arch/arm64/boot/Image ]; then cp out/arch/arm64/boot/Image release/; fi
+          if [ -f out/arch/arm64/boot/Image.gz ]; then cp out/arch/arm64/boot/Image.gz release/; fi
+          if [ -d out/arch/arm64/boot/dts ]; then
             mkdir -p release/dtb
             find out/arch/arm64/boot/dts -name "*.dtb" -exec cp {} release/dtb/ \;
           fi
-          
-          # 打包模块
-          make O=out ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- modules_install INSTALL_MOD_PATH=./modules 2>/dev/null || true
-          if [ -d "modules/lib" ]; then
-            tar -czf release/modules.tar.gz -C modules lib
-          fi
-          
-          echo "Kernel built at $(date)" > release/README.txt
+          make O=out ARCH=arm64 CROSS_COMPILE=$CROSS_COMPILE modules_install INSTALL_MOD_PATH=./modules INSTALL_MOD_STRIP=1
+          tar -czf release/modules.tar.gz -C modules lib
+          printf 'Kernel %s built from %s at %s\n' "${{ github.event.inputs.tag_name }}" "${{ github.sha }}" "$(date -u)" > release/README.txt
+          ls -lh release/
 
-      - name: Create Release
+      - name: 计算 Release tag
+        if: success() && github.event.inputs.create_release == 'true'
+        id: tag
+        run: |
+          TAG="${{ github.event.inputs.tag_name }}"
+          if git ls-remote --exit-code --tags origin "refs/tags/$TAG" >/dev/null 2>&1; then
+            TAG="${TAG}-r${{ github.run_number }}"
+            echo "tag 已存在，改用: $TAG"
+          fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+
+      - name: 创建 Release
+        if: success() && github.event.inputs.create_release == 'true'
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ github.event.inputs.tag_name }}
+          tag_name: ${{ steps.tag.outputs.tag }}
+          name: ${{ steps.tag.outputs.tag }}
           files: release/*
+          generate_release_notes: false
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
