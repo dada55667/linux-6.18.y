@@ -14,13 +14,17 @@ on:
       extra_config:
         description: "额外 config 覆盖，逗号或空格分隔，例如 CONFIG_ACPI=n,CONFIG_LOCALVERSION=-oect"
         required: false
-        default: ""
+        # 关掉 Intel Stratix/Agilex FPGA 平台：unifreq 树的 dwmac-socfpga.c
+        # 引用了不存在的 smtg_crosststamp，而 arm64 defconfig 会因
+        # CONFIG_ARCH_INTEL_SOCFPGA=y 把 DWMAC_SOCFPGA 默认拉成 =m，导致编译失败。
+        # 对 Amlogic / Rockchip 设备完全无用，直接关。
+        default: "CONFIG_ARCH_INTEL_SOCFPGA=n"
       create_release:
         description: "编译成功后是否创建 Release"
         type: boolean
         default: true
 
-# 创建 Release 需要写权限（默认 token 是只读的，缺这段会 403）
+# 创建 Release 需要写权限（默认 token 只读，缺这段会 403）
 permissions:
   contents: write
 
@@ -85,7 +89,7 @@ jobs:
             make O=out ARCH=arm64 CROSS_COMPILE=$CROSS_COMPILE defconfig
           fi
 
-          # 额外覆盖项：CONFIG_X=y / CONFIG_X=n / CONFIG_X="str"
+          # 额外覆盖项：CONFIG_X=y / CONFIG_X=n / CONFIG_X=str
           EXTRA="${{ github.event.inputs.extra_config }}"
           EXTRA="${EXTRA//,/ }"
           if [ -n "${EXTRA// /}" ]; then
@@ -99,7 +103,7 @@ jobs:
           fi
 
           echo "=== 关键配置项 ==="
-          grep -E '^CONFIG_(ACPI|PCI|MODULES|WERROR|DEBUG_INFO)=' out/.config || true
+          grep -E '^CONFIG_(ACPI|PCI|MODULES|WERROR|DEBUG_INFO|ARCH_INTEL_SOCFPGA)=' out/.config || true
           cp out/.config out/.config.used
 
       - name: 编译内核
@@ -107,49 +111,138 @@ jobs:
           set -o pipefail
           make O=out ARCH=arm64 CROSS_COMPILE=$CROSS_COMPILE -j"$(nproc)" 2>&1 | tee build.log
 
-      - name: 输出真实报错（失败时）
-        if: failure()
-        run: |
-          if [ ! -f build.log ]; then
-            echo "build.log 不存在 —— 失败发生在编译之前"
-            exit 0
-          fi
-          echo "=========== 最后 40 行 ==========="
-          tail -n 40 build.log
-          echo "=========== 关键 error 行 ==========="
-          grep -n -E "error:|fatal error|Error [0-9]+|undefined reference|No rule to make target|No space left|Killed" build.log | head -n 30 || true
-          # 把关键报错变成 annotation（可在 Actions 页和 API 直接读到）
-          echo "=========== annotations ==========="
-          grep -E "error:|fatal error|Error [0-9]+|No rule to make target|No space left|Killed" build.log | head -n 15 | cut -c1-900 | tr -d '\r' | while IFS= read -r line; do
-            printf '::error::%s\n' "$line"
-          done
-
-      - name: 上传构建日志
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: build-log-run${{ github.run_number }}
-          path: |
-            build.log
-            out/.config.used
-          retention-days: 14
-          if-no-files-found: warn
-
       - name: 打包产物
         if: success()
         run: |
-          set -euo pipefail
-          mkdir -p release
-          if [ -f out/arch/arm64/boot/Image ]; then cp out/arch/arm64/boot/Image release/; fi
-          if [ -f out/arch/arm64/boot/Image.gz ]; then cp out/arch/arm64/boot/Image.gz release/; fi
-          if [ -d out/arch/arm64/boot/dts ]; then
-            mkdir -p release/dtb
-            find out/arch/arm64/boot/dts -name "*.dtb" -exec cp {} release/dtb/ \;
+          set -uo pipefail
+          {
+            set -x
+            rm -rf release modules
+            mkdir -p release
+
+            # ---------- 内核镜像 ----------
+            for f in out/arch/arm64/boot/Image out/arch/arm64/boot/Image.gz; do
+              [ -f "$f" ] && cp "$f" release/
+            done
+
+            # ---------- dtb ----------
+            if [ -d out/arch/arm64/boot/dts ]; then
+              mkdir -p release/dtb
+              find out/arch/arm64/boot/dts -name '*.dtb' -exec cp {} release/dtb/ \;
+              echo "dtb 数量: $(find release/dtb -name '*.dtb' | wc -l)"
+            fi
+
+            echo "---------- 磁盘 ----------"
+            df -h /
+            du -sh out 2>/dev/null || true
+
+            # ---------- 模块（失败不阻断镜像发布）----------
+            MODROOT="$GITHUB_WORKSPACE/modules"
+            echo "INSTALL_MOD_PATH=$MODROOT"
+
+            # DEPMOD=true 关键：scripts/Makefile.modinst 在收尾时会跑
+            #   scripts/depmod.sh $(DEPMOD) $(KERNELRELEASE)
+            # 新版 kmod 的 depmod 遇到符号依赖环会直接返回非 0，把整个
+            # modules_install 判死（本树里就有 sun8i_mixer <-> sun50i_planes）。
+            # 依赖环只影响模块加载顺序，不影响二进制本身，所以这里禁掉
+            # 内置 depmod，改由下面单独跑一次且不因环失败。
+            if make O=out ARCH=arm64 CROSS_COMPILE=$CROSS_COMPILE \
+                 modules_install \
+                 INSTALL_MOD_PATH="$MODROOT" \
+                 INSTALL_MOD_STRIP=1 \
+                 DEPMOD=true > modules_install.log 2>&1; then
+              echo "modules_install 成功"
+              tail -n 5 modules_install.log
+            else
+              rc=$?
+              echo "::warning::make modules_install 失败，退出码 $rc"
+              # 把真实原因写成 annotation，外部可直接读取
+              tail -n 6 modules_install.log | tr -d '\r' | cut -c1-500 \
+                | while IFS= read -r l; do printf '::warning::mi| %s\n' "$l"; done
+            fi
+
+            # 单独生成 modules.dep（非致命：有依赖环也照样出货，
+            # 设备首次 boot / 安装时还会再 depmod 一次）
+            KVER=$(cat out/include/config/kernel.release 2>/dev/null || true)
+            if [ -n "$KVER" ] && [ -d "$MODROOT/lib/modules/$KVER" ]; then
+              if depmod -b "$MODROOT" "$KVER" > depmod.log 2>&1; then
+                echo "depmod 正常，已生成 modules.dep"
+              else
+                echo "::warning::depmod 报告模块依赖环（不影响使用），已忽略"
+                tail -n 4 depmod.log | tr -d '\r' | cut -c1-300 \
+                  | while IFS= read -r l; do printf '::warning::dep| %s\n' "$l"; done
+              fi
+            fi
+
+            # 兜底：万一模块还是落到了别处，找出来
+            if [ ! -d "$MODROOT/lib" ]; then
+              echo "::warning::$MODROOT/lib 不存在，尝试定位实际安装位置"
+              ALT=$(find "$GITHUB_WORKSPACE" -maxdepth 4 -type d -path '*/lib/modules' 2>/dev/null | head -1)
+              if [ -n "$ALT" ]; then
+                MODROOT=$(dirname "$ALT")
+                echo "实际安装位置: $MODROOT"
+              fi
+            fi
+            ls -la "$GITHUB_WORKSPACE" || true
+
+            if [ -d "$MODROOT/lib" ]; then
+              du -sh "$MODROOT"
+              echo "ko 数量: $(find "$MODROOT" -name '*.ko' | wc -l)"
+              echo "kernel.release: ${KVER:-未知}"
+              if [ -n "$KVER" ] && [ -f "$MODROOT/lib/modules/$KVER/modules.dep" ]; then
+                echo "modules.dep 已生成"
+              else
+                echo "::warning::modules.dep 缺失，设备端首次加载模块前需自行 depmod"
+              fi
+              tar -czf release/modules.tar.gz -C "$MODROOT" lib && echo "modules.tar.gz 打包成功"
+              ls -lh release/modules.tar.gz
+            else
+              echo "::warning::找不到模块目录，本次 release 不含 modules.tar.gz"
+            fi
+
+            printf 'Kernel %s built from %s at %s\n' "${{ github.event.inputs.tag_name }}" "${{ github.sha }}" "$(date -u)" > release/README.txt
+            ls -lh release/
+          } 2>&1 | tee package.log
+
+          if [ ! -f release/Image ]; then
+            echo "::error::release/Image 不存在，打包彻底失败"
+            exit 1
           fi
-          make O=out ARCH=arm64 CROSS_COMPILE=$CROSS_COMPILE modules_install INSTALL_MOD_PATH=$PWD/modules INSTALL_MOD_STRIP=1
-          tar -czf release/modules.tar.gz -C modules lib
-          printf 'Kernel %s built from %s at %s\n' "${{ github.event.inputs.tag_name }}" "${{ github.sha }}" "$(date -u)" > release/README.txt
-          ls -lh release/
+          echo "打包完成（模块若缺失请看上方 warning）"
+
+      - name: 上传构建日志与产物
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: kernel-run${{ github.run_number }}
+          path: |
+            build.log
+            package.log
+            modules_install.log
+            depmod.log
+            out/.config.used
+            release/*
+          retention-days: 14
+          if-no-files-found: warn
+
+      - name: 汇总报错
+        if: failure()
+        run: |
+          found=0
+          for f in build.log package.log; do
+            [ -f "$f" ] || continue
+            found=1
+            echo "=========== $f 最后 40 行 ==========="
+            tail -n 40 "$f"
+            echo "=========== $f 关键错误行 ==========="
+            grep -n -E "error:|fatal error|Error [0-9]+|No such file|Cannot open|No space left|Killed|No rule to make target|undefined reference" "$f" | head -n 25 || true
+            grep -E "error:|fatal error|Error [0-9]+|No such file|Cannot open|No space left|Killed|No rule to make target|undefined reference" "$f" \
+              | head -n 15 | cut -c1-900 | tr -d '\r' \
+              | while IFS= read -r line; do printf '::error::[%s] %s\n' "$f" "$line"; done
+          done
+          if [ "$found" -eq 0 ]; then
+            echo "没有任何构建日志 —— 失败发生在依赖安装或配置阶段"
+          fi
 
       - name: 计算 Release tag
         if: success() && github.event.inputs.create_release == 'true'
