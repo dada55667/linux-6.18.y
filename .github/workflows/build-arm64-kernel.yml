@@ -146,7 +146,7 @@ jobs:
             mkdir -p release/dtb
             find out/arch/arm64/boot/dts -name "*.dtb" -exec cp {} release/dtb/ \;
           fi
-          make O=out ARCH=arm64 CROSS_COMPILE=$CROSS_COMPILE modules_install INSTALL_MOD_PATH=./modules INSTALL_MOD_STRIP=1
+          make O=out ARCH=arm64 CROSS_COMPILE=$CROSS_COMPILE modules_install INSTALL_MOD_PATH=$PWD/modules INSTALL_MOD_STRIP=1
           tar -czf release/modules.tar.gz -C modules lib
           printf 'Kernel %s built from %s at %s\n' "${{ github.event.inputs.tag_name }}" "${{ github.sha }}" "$(date -u)" > release/README.txt
           ls -lh release/
