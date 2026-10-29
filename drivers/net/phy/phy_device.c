@@ -3248,6 +3248,16 @@ static int of_phy_led(struct phy_device *phydev,
 	if (index > U8_MAX)
 		return -EINVAL;
 
+	/*
+	 * Some PHY drivers describe their LEDs completely with private
+	 * device tree properties and program the hardware themselves.  Do
+	 * not register a generic LED class device for those, otherwise the
+	 * netdev LED trigger would take over and fight with the driver.
+	 */
+	if (phydev->drv->led_dt_managed &&
+	    phydev->drv->led_dt_managed(phydev, index))
+		return 0;
+
 	if (of_property_read_bool(led, "active-high"))
 		set_bit(PHY_LED_ACTIVE_HIGH, &modes);
 	if (of_property_read_bool(led, "active-low"))

@@ -1,0 +1,16 @@
+config SPARD_WLAN_SUPPORT
+	bool "Unisoc wireless Support"
+	select AW_WIFI_DEVICE_UWE5622 if ARCH_SUNXI
+	select AW_BIND_VERIFY if ARCH_SUNXI
+	select RK_WIFI_DEVICE_UWE5622 if ARCH_ROCKCHIP
+	select AML_WIFI_DEVICE_UWE5621 if ARCH_MESON
+	help
+	  This is support for spreadtrum wireless chip (UWE5621/5622/5621DS).
+	  On Amlogic (ARCH_MESON) boards, selects the
+	  Amlogic BSP path (uwe5621_bsp_sdio).
+
+if SPARD_WLAN_SUPPORT
+source "drivers/net/wireless/uwe5622/unisocwcn/Kconfig"
+source "drivers/net/wireless/uwe5622/unisocwifi/Kconfig"
+source "drivers/net/wireless/uwe5622/tty-sdio/Kconfig"
+endif

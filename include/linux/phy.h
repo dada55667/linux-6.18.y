@@ -1270,6 +1270,22 @@ struct phy_driver {
 				unsigned long modes);
 
 	/**
+	 * @led_dt_managed: Is the LED fully described by driver private
+	 *                  device tree properties?
+	 * @dev: PHY device which has the LED
+	 * @index: Which LED of the PHY device
+	 *
+	 * Some PHY drivers accept private device tree properties that fully
+	 * describe the LED behaviour (e.g. the RTL8211F "realtek,ledX-triggers"
+	 * properties).  For such LEDs the generic phylib LED registration must
+	 * be skipped, otherwise the netdev LED trigger would take over the LED
+	 * and fight with the configuration programmed by the driver.
+	 *
+	 * Returns true if the LED is managed by the driver via device tree.
+	 */
+	bool (*led_dt_managed)(struct phy_device *dev, u8 index);
+
+	/**
 	 * @get_next_update_time: Get the time until the next update event
 	 * @dev: PHY device
 	 *

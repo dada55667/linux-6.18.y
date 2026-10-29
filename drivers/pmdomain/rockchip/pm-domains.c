@@ -858,7 +858,13 @@ static int rockchip_pm_add_one_domain(struct rockchip_pmu *pmu,
 			dev_err(pmu->dev,
 				"%pOFn: failed to get clk at index %d: %d\n",
 				node, i, error);
-			goto err_put_clocks;
+			/*
+			 * clks[i].clk is an ERR_PTR and must not be handed to
+			 * the clock core. Only release the clocks that were
+			 * acquired successfully before this one.
+			 */
+			clk_bulk_put(i, pd->clks);
+			return error;
 		}
 	}
 

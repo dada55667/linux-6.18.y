@@ -13,10 +13,11 @@
 #include <dt-bindings/pinctrl/rockchip.h>
 #include <dt-bindings/soc/rockchip,vop2.h>
 #include <dt-bindings/thermal/thermal.h>
+#include <dt-bindings/usb/pd.h>
 #include "rk3588s.dtsi"
 
 / {
-	model = "Alientek QuarkPI-CA2";
+	model = "Alientek QuarkPi-CA2";
 	compatible = "alientek,quarkpi-ca2", "rockchip,rk3588s";
 
 	reserved-memory {
@@ -61,6 +62,20 @@
 			label = "volume down";
 			linux,code = <KEY_VOLUMEDOWN>;
 			press-threshold-microvolt = <417000>;
+		};
+	};
+
+	headset_keys: headset-keys {
+		compatible = "adc-keys";
+		io-channels = <&saradc 3>;
+		io-channel-names = "buttons";
+		keyup-threshold-microvolt = <1800000>;
+		poll-interval = <100>;
+
+		button-play-pause {
+			label = "play pause";
+			linux,code = <KEY_PLAYPAUSE>;
+			press-threshold-microvolt = <2000>;
 		};
 	};
 
@@ -123,6 +138,26 @@
 		vin-supply = <&vcc5v0_sys>;
 	};
 
+	combophy_avdd0v85: regulator-combophy-avdd0v85 {
+		compatible = "regulator-fixed";
+		regulator-name = "combophy_avdd0v85";
+		regulator-always-on;
+		regulator-boot-on;
+		regulator-min-microvolt = <850000>;
+		regulator-max-microvolt = <850000>;
+		vin-supply = <&vdd_0v85_s0>;
+	};
+
+	combophy_avdd1v8: regulator-combophy-avdd1v8 {
+		compatible = "regulator-fixed";
+		regulator-name = "combophy_avdd1v8";
+		regulator-always-on;
+		regulator-boot-on;
+		regulator-min-microvolt = <1800000>;
+		regulator-max-microvolt = <1800000>;
+		vin-supply = <&avcc_1v8_s0>;
+	};
+
 	vcc_3v3_sd_s0: regulator-vcc-3v3-sd-s0 {
 		compatible = "regulator-fixed";
 		gpios = <&gpio0 RK_PA0 GPIO_ACTIVE_LOW>;
@@ -132,6 +167,16 @@
 		regulator-min-microvolt = <3300000>;
 		regulator-max-microvolt = <3300000>;
 		vin-supply = <&vcc_3v3_s3>;
+	};
+
+	vcc3v3_pcie: regulator-vcc3v3-pcie {
+		compatible = "regulator-fixed";
+		regulator-name = "vcc3v3_pcie";
+		regulator-always-on;
+		regulator-boot-on;
+		regulator-min-microvolt = <3300000>;
+		regulator-max-microvolt = <3300000>;
+		vin-supply = <&vcc12v_dcin>;
 	};
 };
 
@@ -267,7 +312,7 @@
 			};
 
 			vcc_2v0_pldo_s3: dcdc-reg7 {
-				regulator-name = "vcc_2v0_pldo_s3";
+				regulator-name = "vdd_2v0_pldo_s3";
 				regulator-always-on;
 				regulator-boot-on;
 				regulator-min-microvolt = <2000000>;
@@ -531,10 +576,10 @@
 			compatible = "usb-c-connector";
 			label = "USB-C";
 			power-role = "dual";
-			data-role = "host";
+			data-role = "dual";
 			try-power-role = "sink";
-			source-pdos = <0x401912c>;
-			sink-pdos = <0x4019064>;
+			source-pdos = <PDO_FIXED(5000, 3000, PDO_FIXED_USB_COMM)>;
+			sink-pdos = <PDO_FIXED(5000, 1000, PDO_FIXED_USB_COMM)>;
 			op-sink-microwatt = <1000000>;
 
 			altmodes {
@@ -550,22 +595,25 @@
 
 				port@0 {
 					reg = <0>;
-					usbc0_hs: endpoint {
-						remote-endpoint = <&usb_host0_hs_ep>;
+
+					usbc0_orien_sw: endpoint {
+						remote-endpoint = <&usbdp_phy0_orientation_switch>;
 					};
 				};
 
 				port@1 {
 					reg = <1>;
-					usbc0_ss: endpoint {
-						remote-endpoint = <&usbdp_phy0_ss_out>;
+
+					usbc0_role_sw: endpoint {
+						remote-endpoint = <&dwc3_0_role_switch>;
 					};
 				};
 
 				port@2 {
 					reg = <2>;
-					usbc0_sbu: endpoint {
-						remote-endpoint = <&usbdp_phy0_dp_out>;
+
+					dp_altmode_mux: endpoint {
+						remote-endpoint = <&usbdp_phy0_dp_altmode_mux>;
 					};
 				};
 			};
@@ -644,6 +692,7 @@
 	max-frequency = <200000000>;
 	mmc-hs400-1_8v;
 	mmc-hs400-enhanced-strobe;
+	full-pwr-cycle-in-suspend;
 	vmmc-supply = <&vcc_3v3_s3>;
 	vqmmc-supply = <&vcc_1v8_s3>;
 	status = "okay";
@@ -735,6 +784,7 @@
 };
 
 &pwm7 {
+	pinctrl-names = "default";
 	pinctrl-0 = <&pwm7m0_pins>;
 	status = "okay";
 };
@@ -751,7 +801,7 @@
 &pinctrl {
 	sdmmc {
 		sd_s0_pwr: sd-s0-pwr {
-			rockchip,pins = <0 RK_PA0 RK_FUNC_GPIO &pcfg_pull_none>;
+			rockchip,pins = <0 RK_PA0 RK_FUNC_GPIO &pcfg_pull_up>;
 		};
 	};
 
@@ -889,6 +939,7 @@
 };
 
 &sata0 {
+	/* shares combphy0_ps with pcie2x1l2 */
 	status = "disabled";
 };
 
@@ -900,7 +951,7 @@
 	pinctrl-names = "default";
 	pinctrl-0 = <&pcie2x1l2_perstn>;
 	reset-gpios = <&gpio3 RK_PB2 GPIO_ACTIVE_HIGH>;
-	vpcie3v3-supply = <&vcc_3v3_s3>;
+	vpcie3v3-supply = <&vcc3v3_pcie>;
 	status = "okay";
 };
 
@@ -921,25 +972,16 @@
 };
 
 &usb_host0_xhci {
-	dr_mode = "host";
+	usb-role-switch;
 	status = "okay";
 
-	ports {
+	port {
 		#address-cells = <1>;
 		#size-cells = <0>;
 
-		port@0 {
+		dwc3_0_role_switch: endpoint@0 {
 			reg = <0>;
-			usb_host0_hs_ep: endpoint {
-				remote-endpoint = <&usbc0_hs>;
-			};
-		};
-
-		port@1 {
-			reg = <1>;
-			usb_host0_ss_ep: endpoint {
-				remote-endpoint = <&usbdp_phy0_ss_in>;
-			};
+			remote-endpoint = <&usbc0_role_sw>;
 		};
 	};
 };
@@ -963,7 +1005,7 @@
 		regulator-min-microvolt = <5000000>;
 		regulator-max-microvolt = <5000000>;
 		gpios = <&gpio1 RK_PD5 GPIO_ACTIVE_HIGH>;
-		vin-supply = <&vcc5v0_sys>;
+		vin-supply = <&vcc5v0_usb>;
 		pinctrl-names = "default";
 		pinctrl-0 = <&typec5v_pwren>;
 	};
@@ -978,7 +1020,10 @@
 		compatible = "everest,es8388", "everest,es8328";
 		reg = <0x11>;
 		clocks = <&cru I2S0_8CH_MCLKOUT_TO_IO>;
+		clock-names = "mclk";
 		assigned-clocks = <&cru I2S0_8CH_MCLKOUT>;
+		pinctrl-names = "default";
+		pinctrl-0 = <&i2s0_mclk>;
 		assigned-clock-rates = <12288000>;
 		AVDD-supply = <&vcc_3v3_s0>;
 		DVDD-supply = <&vcc_1v8_s0>;
@@ -990,7 +1035,7 @@
 
 &i2s0_8ch {
 	pinctrl-names = "default";
-	pinctrl-0 = <&i2s0_lrck &i2s0_mclk &i2s0_sclk &i2s0_sdi0 &i2s0_sdo0>;
+	pinctrl-0 = <&i2s0_lrck &i2s0_sclk &i2s0_sdi0 &i2s0_sdo0>;
 	status = "okay";
 };
 
@@ -1001,7 +1046,7 @@
 		};
 
 		hp_con: hp-con {
-			rockchip,pins = <1 RK_PC6 RK_FUNC_GPIO &pcfg_pull_none>;
+			rockchip,pins = <1 RK_PC6 RK_FUNC_GPIO &pcfg_pull_down>;
 		};
 	};
 };
@@ -1018,11 +1063,10 @@
 		simple-audio-card,mclk-fs = <256>;
 		simple-audio-card,aux-devs = <&hp_amp>;
 		simple-audio-card,hp-det-gpios = <&gpio1 RK_PC4 GPIO_ACTIVE_HIGH>;
-		simple-audio-card,pin-switches = "Headphones";
+		simple-audio-card,pin-switches = "Headphones", "Headset Mic";
 		simple-audio-card,widgets =
 			"Headphone", "Headphones",
-			"Microphone", "Headset Mic",
-			"Microphone", "Main Mic";
+			"Microphone", "Headset Mic";
 		simple-audio-card,routing =
 			"Headphones", "LOUT1",
 			"Headphones", "ROUT1",
@@ -1031,10 +1075,7 @@
 			"Headphone Power INL", "LOUT1",
 			"Headphone Power INR", "ROUT1",
 			"LINPUT1", "Headset Mic",
-			"LINPUT2", "Main Mic",
-			"RINPUT1", "Headset Mic",
-			"RINPUT2", "Main Mic";
-
+			"RINPUT1", "Headset Mic";
 		sound_cpu: simple-audio-card,cpu {
 			sound-dai = <&i2s0_8ch>;
 		};
@@ -1058,6 +1099,17 @@
 	status = "okay";
 };
 
+&i2c4 {
+	pinctrl-names = "default";
+	pinctrl-0 = <&i2c4m3_xfer>;
+	status = "okay";
+};
+
+&i2c7 {
+	pinctrl-names = "default";
+	pinctrl-0 = <&i2c7m0_xfer>;
+	status = "okay";
+};
 
 &uart5 {
 	pinctrl-names = "default";
@@ -1067,15 +1119,13 @@
 
 &spi0 {
 	pinctrl-names = "default";
-	pinctrl-0 = <&spi0m3_pins>, <&spi0m3_cs0>, <&spi0m3_cs1>;
+	pinctrl-0 = <&spi0m3_pins>;
+	cs-gpios = <&gpio3 RK_PD4 GPIO_ACTIVE_LOW>,
+		<&gpio3 RK_PD5 GPIO_ACTIVE_LOW>;
 	num-cs = <2>;
 	status = "okay";
 
 };
-
-&rga3_core0 {};
-
-&rga3_core1 {};
 
 &pinctrl {
 	ir {
@@ -1085,7 +1135,6 @@
 	};
 };
 
-
 &{/} {
 	ir_receiver: ir-receiver {
 		compatible = "gpio-ir-receiver";
@@ -1094,7 +1143,6 @@
 		pinctrl-0 = <&ir_receiver_pin>;
 	};
 };
-
 
 &dp0 {
 	status = "okay";
@@ -1120,10 +1168,10 @@
 };
 
 &usbdp_phy0 {
-	orientation-switch;
 	mode-switch;
-	sbu1-dc-gpios = <&gpio4 RK_PA6 GPIO_ACTIVE_HIGH>;
-	sbu2-dc-gpios = <&gpio4 RK_PA7 GPIO_ACTIVE_HIGH>;
+	orientation-switch;
+	sbu1-dc-gpios = <&gpio1 RK_PA6 GPIO_ACTIVE_HIGH>;
+	sbu2-dc-gpios = <&gpio1 RK_PA7 GPIO_ACTIVE_HIGH>;
 	rockchip,dp-lane-mux = <2 3>;
 	status = "okay";
 
@@ -1131,24 +1179,31 @@
 		#address-cells = <1>;
 		#size-cells = <0>;
 
-		usbdp_phy0_ss_out: endpoint@0 {
+		usbdp_phy0_orientation_switch: endpoint@0 {
 			reg = <0>;
-			remote-endpoint = <&usbc0_ss>;
+			remote-endpoint = <&usbc0_orien_sw>;
 		};
 
-		usbdp_phy0_ss_in: endpoint@1 {
+		usbdp_phy0_dp_altmode_mux: endpoint@1 {
 			reg = <1>;
-			remote-endpoint = <&usb_host0_ss_ep>;
+			remote-endpoint = <&dp_altmode_mux>;
 		};
 
 		usbdp_phy0_dp_in: endpoint@2 {
 			reg = <2>;
 			remote-endpoint = <&dp0_out_con>;
 		};
-
-		usbdp_phy0_dp_out: endpoint@3 {
-			reg = <3>;
-			remote-endpoint = <&usbc0_sbu>;
-		};
 	};
+};
+
+&i2c5 {
+	pinctrl-names = "default";
+	pinctrl-0 = <&i2c5m2_xfer>;
+	status = "okay";
+};
+
+&pwm14 {
+	pinctrl-names = "default";
+	pinctrl-0 = <&pwm14m1_pins>;
+	status = "okay";
 };

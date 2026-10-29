@@ -1,0 +1,183 @@
+// SPDX-License-Identifier: (GPL-2.0+ OR MIT)
+/*
+ * E900V22C: share sd_emmc_b between the SD card slot and the UWE5621DS
+ * Wi-Fi module, like the vendor Android tree does.
+ *
+ * The module is wired to the GPIOX SDIO pads and the SD card slot to the
+ * GPIOC pads. sd_emmc_b reaches the GPIOX pads through the virtual
+ * sdio_dummy mux. Each pad group is a slot of the controller, and the
+ * slots take turns on sd_emmc_b.
+ */
+/dts-v1/;
+/plugin/;
+
+#include <dt-bindings/gpio/gpio.h>
+#include <dt-bindings/gpio/meson-g12a-gpio.h>
+
+/* 32.768 kHz sleep clock for the module (wifi32k), from the crystal. */
+&pwm_ef {
+	clocks = <&xtal>;
+	pinctrl-0 = <&pwm_e_pins>;
+	pinctrl-names = "default";
+	status = "okay";
+};
+
+&periphs_pinctrl {
+	/* Wi-Fi slot: GPIOC pads parked as GPIOs, SDIO on GPIOX */
+	sdio_b_pins: sdio-b {
+		mux-sd-clear-data {
+			groups = "GPIOC_0", "GPIOC_1", "GPIOC_2",
+				 "GPIOC_3", "GPIOC_5";
+			function = "gpio_periphs";
+			output-high;
+		};
+
+		mux-sd-clear-clock {
+			groups = "GPIOC_4";
+			function = "gpio_periphs";
+			output-low;
+		};
+
+		mux-data {
+			groups = "GPIOX_0", "GPIOX_1", "GPIOX_2",
+				 "GPIOX_3", "GPIOX_5";
+			function = "gpio_periphs";
+			input-enable;
+			bias-pull-up;
+			drive-strength-microamp = <4000>;
+		};
+
+		mux-clock {
+			groups = "GPIOX_4";
+			function = "gpio_periphs";
+			bias-pull-up;
+			output-high;
+			drive-strength-microamp = <4000>;
+		};
+
+		mux-route {
+			groups = "sdio_dummy";
+			function = "sdio";
+			bias-pull-up;
+			output-high;
+		};
+	};
+
+	sdio_b_clk_gate_pins: sdio-b-clk-gate {
+		mux-sd-clear-data {
+			groups = "GPIOC_0", "GPIOC_1", "GPIOC_2",
+				 "GPIOC_3", "GPIOC_5";
+			function = "gpio_periphs";
+			output-high;
+		};
+
+		mux-sd-clear-clock {
+			groups = "GPIOC_4";
+			function = "gpio_periphs";
+			output-low;
+		};
+
+		mux-command {
+			groups = "GPIOX_5";
+			function = "gpio_periphs";
+			input-enable;
+			bias-pull-up;
+			drive-strength-microamp = <4000>;
+		};
+
+		mux-clock {
+			groups = "GPIOX_4";
+			function = "gpio_periphs";
+			bias-pull-up;
+			output-high;
+			drive-strength-microamp = <4000>;
+		};
+
+		mux-route {
+			groups = "sdio_dummy";
+			function = "sdio";
+			bias-pull-up;
+			output-high;
+		};
+	};
+
+	/* SD card slot: route to GPIOX off, Wi-Fi clock pad held low */
+	sdio_b_route_off_pins: sdio-b-route-off {
+		mux-route {
+			groups = "GPIOV_0";
+			function = "gpio_periphs";
+			bias-pull-up;
+			output-low;
+		};
+
+		mux-clock {
+			groups = "GPIOX_4";
+			function = "gpio_periphs";
+			output-low;
+		};
+	};
+};
+
+/* The GPIOX pads now belong to sd_emmc_b. */
+&sd_emmc_a {
+	status = "disabled";
+};
+
+&sd_emmc_b {
+	pinctrl-0 = <&sdio_b_pins>;
+	pinctrl-1 = <&sdcard_c_pins>, <&sdio_b_route_off_pins>;
+	pinctrl-2 = <&sdcard_clk_gate_c_pins>, <&sdio_b_route_off_pins>;
+	pinctrl-3 = <&sdio_b_pins>;
+	pinctrl-4 = <&sdio_b_clk_gate_pins>;
+	pinctrl-names = "default", "slot0", "slot0-clk-gate", "slot1",
+			"slot1-clk-gate";
+	#address-cells = <1>;
+	#size-cells = <0>;
+	status = "okay";
+
+	/* SD card */
+	slot@0 {
+		compatible = "mmc-slot";
+		reg = <0>;
+		bus-width = <4>;
+		cap-sd-highspeed;
+		max-frequency = <50000000>;
+		disable-wp;
+		cd-gpios = <&gpio GPIOC_6 GPIO_ACTIVE_LOW>;
+		vmmc-supply = <&vddao_3v3>;
+		vqmmc-supply = <&vddao_3v3>;
+	};
+
+	/* UWE5621DS Wi-Fi */
+	slot@1 {
+		compatible = "mmc-slot";
+		reg = <1>;
+		#address-cells = <1>;
+		#size-cells = <0>;
+
+		bus-width = <4>;
+		cap-sd-highspeed;
+		cap-sdio-irq;
+		sd-uhs-sdr50;
+		sd-uhs-sdr104;
+		/* Android runs the module at 166 MHz; 200 MHz is not validated. */
+		max-frequency = <166666667>;
+		/* The vendor power driver holds the module in reset for ~321 ms. */
+		post-power-on-delay-ms = <300>;
+
+		non-removable;
+		disable-wp;
+		keep-power-in-suspend;
+		/* The GPIOX pads run from a fixed 1.8 V rail: skip the CMD11 switch. */
+		zte,sdio-fixed-1-8v;
+
+		mmc-pwrseq = <&sdio_pwrseq>;
+		vmmc-supply = <&vddao_3v3>;
+		vqmmc-supply = <&vddao_1v8>;
+
+		wifi@1 {
+			compatible = "sprd,unisoc-wifi";
+			reg = <1>;
+		};
+	};
+};

@@ -208,7 +208,7 @@ struct rtl821x_priv {
 	/* rtl8211f */
 	u16 iner;
 	/* LED configuration from device tree */
-	bool led_dts_configured;
+	bool led_dts_configured[RTL8211x_LED_COUNT];
 	u16 led_reg_val;
 };
 
@@ -229,13 +229,34 @@ static const char *rtl8211f_led_propnames[] = {
 	"realtek,led2-triggers",
 };
 
+static bool rtl8211f_led_dts_managed(struct rtl821x_priv *priv, u8 index)
+{
+	if (!priv)
+		return false;
+
+	return index < RTL8211x_LED_COUNT && priv->led_dts_configured[index];
+}
+
+/*
+ * Tell phylib not to register a generic LED class device for LEDs that are
+ * fully described by the "realtek,ledX-triggers" device tree properties.
+ * Otherwise the netdev LED trigger would take over the LED and fight with
+ * the configuration programmed here.
+ */
+static bool rtl8211f_led_dt_managed(struct phy_device *phydev, u8 index)
+{
+	return rtl8211f_led_dts_managed(phydev->priv, index);
+}
+
 static void rtl8211f_apply_led_config(struct phy_device *phydev)
 {
 	struct rtl821x_priv *priv = phydev->priv;
 	u16 reg;
 	int ret;
 
-	if (!priv->led_dts_configured)
+	if (!rtl8211f_led_dts_managed(priv, 0) &&
+	    !rtl8211f_led_dts_managed(priv, 1) &&
+	    !rtl8211f_led_dts_managed(priv, 2))
 		return;
 
 	reg = priv->led_reg_val | RTL8211F_LEDCR_MODE;
@@ -301,7 +322,7 @@ static void rtl8211f_parse_led_triggers(struct phy_device *phydev, u8 led_index,
 	if (rules) {
 		priv->led_reg_val |= (rtl8211f_rules_to_led_bits(rules) <<
 				      (RTL8211F_LEDCR_SHIFT * led_index));
-		priv->led_dts_configured = true;
+		priv->led_dts_configured[led_index] = true;
 	}
 }
 
@@ -801,7 +822,6 @@ static int rtl8211f_config_phy_eee(struct phy_device *phydev)
 static int rtl8211f_config_init(struct phy_device *phydev)
 {
 	struct device *dev = &phydev->mdio.dev;
-	struct rtl821x_priv *priv = phydev->priv;
 	int ret;
 
 	ret = rtl8211f_config_aldps(phydev);
@@ -822,9 +842,7 @@ static int rtl8211f_config_init(struct phy_device *phydev)
 		return ret;
 	}
 
-	if (priv->led_dts_configured) {
-		rtl8211f_apply_led_config(phydev);
-	}
+	rtl8211f_apply_led_config(phydev);
 
 	return rtl8211f_config_phy_eee(phydev);
 }
@@ -924,9 +942,7 @@ static int rtl8211f_resume(struct phy_device *phydev)
 	if (device_may_wakeup(&phydev->mdio.dev))
 		ret = phy_write_paged(phydev, 0xa42, RTL821x_INER, priv->iner);
 
-	if (priv->led_dts_configured) {
-		rtl8211f_apply_led_config(phydev);
-	}
+	rtl8211f_apply_led_config(phydev);
 
 	return ret;
 }
@@ -942,7 +958,7 @@ static int rtl8211x_led_hw_is_supported(struct phy_device *phydev, u8 index,
 				   BIT(TRIGGER_NETDEV_RX) |
 				   BIT(TRIGGER_NETDEV_TX);
 
-	if (priv && priv->led_dts_configured)
+	if (rtl8211f_led_dts_managed(priv, index))
 		return -EOPNOTSUPP;
 
 	/* The RTL8211F PHY supports these LED settings on up to three LEDs:
@@ -2181,6 +2197,7 @@ static struct phy_driver realtek_drvs[] = {
 		.led_hw_is_supported = rtl8211x_led_hw_is_supported,
 		.led_hw_control_get = rtl8211f_led_hw_control_get,
 		.led_hw_control_set = rtl8211f_led_hw_control_set,
+		.led_dt_managed	= rtl8211f_led_dt_managed,
 	}, {
 		PHY_ID_MATCH_EXACT(RTL_8211FVD_PHYID),
 		.name		= "RTL8211F-VD Gigabit Ethernet",
@@ -2197,6 +2214,7 @@ static struct phy_driver realtek_drvs[] = {
 		.led_hw_is_supported = rtl8211x_led_hw_is_supported,
 		.led_hw_control_get = rtl8211f_led_hw_control_get,
 		.led_hw_control_set = rtl8211f_led_hw_control_set,
+		.led_dt_managed	= rtl8211f_led_dt_managed,
 	}, {
 		.name		= "Generic FE-GE Realtek PHY",
 		.match_phy_device = rtlgen_match_phy_device,

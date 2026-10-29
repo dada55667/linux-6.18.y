@@ -540,6 +540,9 @@ static const struct meson_pmx_group meson_g12a_periphs_groups[] = {
 	GPIO_GROUP(GPIOX_18),
 	GPIO_GROUP(GPIOX_19),
 
+	/* bank V */
+	GPIO_GROUP(GPIOV_0),
+
 	/* bank BOOT */
 	GROUP(emmc_nand_d0,		1),
 	GROUP(emmc_nand_d1,		1),
@@ -985,6 +988,8 @@ static const char * const gpio_periphs_groups[] = {
 	"GPIOX_5", "GPIOX_6", "GPIOX_7", "GPIOX_8", "GPIOX_9",
 	"GPIOX_10", "GPIOX_11", "GPIOX_12", "GPIOX_13", "GPIOX_14",
 	"GPIOX_15", "GPIOX_16", "GPIOX_17", "GPIOX_18", "GPIOX_19",
+
+	"GPIOV_0",
 };
 
 static const char * const emmc_groups[] = {

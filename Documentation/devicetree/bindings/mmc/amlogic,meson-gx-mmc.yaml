@@ -58,6 +58,28 @@ properties:
   power-domains:
     maxItems: 1
 
+  pinctrl-names:
+    description: |
+      "default" and the optional "clk-gate" state, which keeps the clock
+      pad low while the clock is gated. A controller with slot nodes also
+      has a "slotN" state that connects slot N to the controller, and an
+      optional "slotN-clk-gate" state.
+
+patternProperties:
+  "^slot@[01]$":
+    $ref: mmc-slot.yaml#
+    description:
+      A card slot. Without slot nodes the controller node describes its
+      only slot. With slot nodes, each enabled slot gets its own MMC host
+      and the slots take turns on the controller, which reaches the card
+      of a slot through the pins of its "slotN" pinctrl state.
+    properties:
+      reg:
+        maximum: 1
+
+    required:
+      - compatible
+
 required:
   - compatible
   - reg
@@ -80,4 +102,42 @@ examples:
         clock-names = "core", "clkin0", "clkin1";
         pinctrl-0 = <&emm_pins>;
         resets = <&reset_mmc>;
+    };
+
+  - |
+    #include <dt-bindings/interrupt-controller/irq.h>
+    #include <dt-bindings/interrupt-controller/arm-gic.h>
+    mmc@ffe05000 {
+        compatible = "amlogic,meson-axg-mmc";
+        reg = <0xffe05000 0x800>;
+        interrupts = <GIC_SPI 190 IRQ_TYPE_EDGE_RISING>;
+        clocks = <&clk_mmc>, <&xtal>, <&clk_div>;
+        clock-names = "core", "clkin0", "clkin1";
+        resets = <&reset_mmc>;
+        pinctrl-0 = <&sdio_pins>;
+        pinctrl-1 = <&sdcard_pins>;
+        pinctrl-2 = <&sdcard_clk_gate_pins>;
+        pinctrl-3 = <&sdio_pins>;
+        pinctrl-4 = <&sdio_clk_gate_pins>;
+        pinctrl-names = "default", "slot0", "slot0-clk-gate", "slot1",
+                        "slot1-clk-gate";
+        #address-cells = <1>;
+        #size-cells = <0>;
+
+        slot@0 {
+            compatible = "mmc-slot";
+            reg = <0>;
+            bus-width = <4>;
+            cap-sd-highspeed;
+            max-frequency = <50000000>;
+        };
+
+        slot@1 {
+            compatible = "mmc-slot";
+            reg = <1>;
+            bus-width = <4>;
+            cap-sdio-irq;
+            non-removable;
+            max-frequency = <100000000>;
+        };
     };

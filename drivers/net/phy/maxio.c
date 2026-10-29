@@ -420,6 +420,17 @@ static bool mae0621a_led_dts_managed(struct maxio_priv *priv, u8 index)
 	return index < MAE0621A_LED_COUNT && priv->led_dts_cfg[index];
 }
 
+/*
+ * Tell phylib not to register a generic LED class device for LEDs that are
+ * fully described by the "maxio,ledX-triggers" / "maxio,led-data" device
+ * tree properties.  Otherwise the netdev LED trigger would take over the
+ * LED and fight with the configuration programmed here.
+ */
+static bool mae0621a_led_dt_managed(struct phy_device *phydev, u8 index)
+{
+	return mae0621a_led_dts_managed(phydev->priv, index);
+}
+
 static int mae0621a_led_hw_is_supported(struct phy_device *phydev, u8 index,
 					unsigned long rules)
 {
@@ -854,6 +865,7 @@ static struct phy_driver maxio_drvs[] = {
 		.led_hw_is_supported = mae0621a_led_hw_is_supported,
 		.led_hw_control_get = mae0621a_led_hw_control_get,
 		.led_hw_control_set = mae0621a_led_hw_control_set,
+		.led_dt_managed	= mae0621a_led_dt_managed,
 	},
 	{
 		.phy_id		= MAE0621A_PHY_ID_Q3C,
@@ -874,6 +886,7 @@ static struct phy_driver maxio_drvs[] = {
 		.led_hw_is_supported = mae0621a_led_hw_is_supported,
 		.led_hw_control_get = mae0621a_led_hw_control_get,
 		.led_hw_control_set = mae0621a_led_hw_control_set,
+		.led_dt_managed	= mae0621a_led_dt_managed,
 	},
 };
 module_phy_driver(maxio_drvs);
