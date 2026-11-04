@@ -11,7 +11,7 @@
 #include "ps.h"
 #include "reg.h"
 
-#define RTW89_COEX_VERSION 0x09180113
+#define RTW89_COEX_VERSION 0x09180213
 #define FCXDEF_STEP 50 /* MUST <= FCXMAX_STEP and match with wl fw*/
 #define BTC_E2G_LIMIT_DEF 80
 
@@ -1114,7 +1114,7 @@ static int _send_fw_cmd(struct rtw89_dev *rtwdev, u8 h2c_class, u8 h2c_func,
 			_reset_h2c_macro(btc);
 
 		/* Type:1 byte, Length:2 Bytes, Data:len bytes */
-		if (btc->hbuf_len + len + 3 >= BTC_H2C_MAXLEN) {
+		if (btc->hbuf_len + len + 3 > BTC_H2C_MAXLEN) {
 			rtw89_debug(rtwdev, RTW89_DBG_BTC,
 				    "[BTC], %s():return by MACRO buf full(%d)\n",
 				    __func__, btc->hbuf_len + len + 3);

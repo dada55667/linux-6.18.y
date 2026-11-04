@@ -791,6 +791,9 @@ enum rtw89_regulation_type {
 	RTW89_QATAR	= 13,
 	RTW89_UK	= 14,
 	RTW89_THAILAND	= 15,
+	RTW89_NZ	= 16,
+	RTW89_BR	= 17,
+	RTW89_AR	= 18,
 	RTW89_REGD_NUM,
 };
 
@@ -4476,7 +4479,7 @@ struct rtw89_btc_btf_fwinfo {
 };
 
 #define RTW89_BTC_POLICY_MAXLEN 512
-#define BTC_H2C_MAXLENC 2020
+#define BTC_H2C_MAXLEN 2020
 
 struct rtw89_btc {
 	const struct rtw89_btc_ver *ver;
@@ -4497,7 +4500,7 @@ struct rtw89_btc {
 	u32 bt_req_len[RTW89_PHY_NUM];
 
 	u8 policy[RTW89_BTC_POLICY_MAXLEN];
-	u8 hbuf[BTC_H2C_MAXLENC]; /* H2C Macro buffer */
+	u8 hbuf[BTC_H2C_MAXLEN]; /* H2C Macro buffer */
 	u8 hbuf_cnt; /* H2C cmd count in buffer */
 	u8 ant_type;
 	u8 btg_pos;
@@ -6572,6 +6575,7 @@ enum rtw89_quirks {
 	RTW89_QUIRK_THERMAL_PROT_VCORE,
 	RTW89_QUIRK_HW_INFO_SYSFS,
 	RTW89_QUIRK_DISABLE_2GHZ,
+	RTW89_QUIRK_1ANT,
 
 	NUM_OF_RTW89_QUIRKS,
 };
