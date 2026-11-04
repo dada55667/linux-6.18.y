@@ -174,6 +174,7 @@ struct meson_mmc_data {
 	unsigned int always_on;
 	unsigned int adjust;
 	unsigned int irq_sdio_sleep;
+	bool has_pipeline_clk;
 	/* card timing registers, saved and restored on a slot switch */
 	const unsigned int *slot_regs;
 	unsigned int num_slot_regs;
@@ -549,7 +550,7 @@ static int meson_mmc_clk_set(struct meson_slot *slot, unsigned long rate,
  */
 static int meson_mmc_clk_init(struct meson_host *host)
 {
-	struct clk_init_data init;
+	struct clk_init_data init = {};
 	struct clk_mux *mux;
 	struct clk_divider *div;
 	char clk_name[32];
@@ -1911,7 +1912,8 @@ static int meson_mmc_probe(struct platform_device *pdev)
 	struct mmc_host *mmc;
 	struct clk *core_clk;
 	unsigned int i;
-	int cd_irq, ret;
+	int cd_irq = -ENXIO;
+	int ret;
 
 	host = devm_kzalloc(&pdev->dev, sizeof(*host), GFP_KERNEL);
 	if (!host)
@@ -1951,7 +1953,11 @@ static int meson_mmc_probe(struct platform_device *pdev)
 	 * meson_mmc_cd_gpio_poll_start()).
 	 */
 	if (!host->multi_slot) {
-		cd_irq = platform_get_irq_optional(pdev, 1);
+		ret = platform_get_irq_optional(pdev, 1);
+		if (ret < 0 && ret != -ENXIO)
+			return ret;
+		if (ret > 0)
+			cd_irq = ret;
 		mmc_gpio_set_cd_irq(host->mmc, cd_irq);
 	}
 
@@ -1962,6 +1968,15 @@ static int meson_mmc_probe(struct platform_device *pdev)
 	core_clk = devm_clk_get_enabled(&pdev->dev, "core");
 	if (IS_ERR(core_clk))
 		return PTR_ERR(core_clk);
+
+	if (host->data->has_pipeline_clk) {
+		struct clk *pipe_clk;
+
+		pipe_clk = devm_clk_get_enabled(&pdev->dev, "pipeline");
+		if (IS_ERR(pipe_clk))
+			return dev_err_probe(&pdev->dev, PTR_ERR(pipe_clk),
+					     "missing pipeline clock\n");
+	}
 
 	ret = meson_mmc_clk_init(host);
 	if (ret)
@@ -2095,12 +2110,22 @@ static const struct meson_mmc_data meson_axg_data = {
 	.num_slot_regs	= ARRAY_SIZE(meson_axg_slot_regs),
 };
 
+static const struct meson_mmc_data meson_t7_data = {
+	.tx_delay_mask	= CLK_V3_TX_DELAY_MASK,
+	.rx_delay_mask	= CLK_V3_RX_DELAY_MASK,
+	.always_on	= CLK_V3_ALWAYS_ON,
+	.adjust		= SD_EMMC_V3_ADJUST,
+	.irq_sdio_sleep	= CLK_V3_IRQ_SDIO_SLEEP,
+	.has_pipeline_clk = true,
+};
+
 static const struct of_device_id meson_mmc_of_match[] = {
 	{ .compatible = "amlogic,meson-gx-mmc",		.data = &meson_gx_data },
 	{ .compatible = "amlogic,meson-gxbb-mmc", 	.data = &meson_gx_data },
 	{ .compatible = "amlogic,meson-gxl-mmc",	.data = &meson_gx_data },
 	{ .compatible = "amlogic,meson-gxm-mmc",	.data = &meson_gx_data },
 	{ .compatible = "amlogic,meson-axg-mmc",	.data = &meson_axg_data },
+	{ .compatible = "amlogic,t7-mmc",		.data = &meson_t7_data },
 	{}
 };
 MODULE_DEVICE_TABLE(of, meson_mmc_of_match);
